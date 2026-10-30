@@ -282,6 +282,65 @@ export GAZEBO_HEADLESS_RENDERING=1
 export GZ_SIM_HEADLESS=1
 ```
 
+### Slow/laggy Gazebo rendering under WSL2
+
+Often caused by falling back to CPU software rendering (`llvmpipe`). Check:
+
+```bash
+glxinfo | grep "OpenGL renderer"
+```
+
+If it shows `llvmpipe`, force Mesa's D3D12 backend:
+
+```bash
+export GALLIUM_DRIVER=d3d12
+```
+
+On the reference RTX 4050 + AMD iGPU laptop this renders through the AMD
+integrated GPU and is stable. Forcing the discrete NVIDIA GPU with
+`MESA_D3D12_DEFAULT_ADAPTER_NAME="NVIDIA GeForce RTX 4050 Laptop GPU"` was
+tested and reliably crashed Gazebo's GUI during OpenGL context creation
+(`glx: failed to create drisw screen` → `Aborted (core dumped)`). This appears
+specific to Gazebo's Qt/QML rendering path. Leave `GALLIUM_DRIVER=d3d12` alone
+on this hardware; test adapter overrides in a throwaway shell before adding
+them to your profile.
+
+For the lowest perception latency, close or kill the Gazebo GUI while keeping
+the server alive:
+
+```bash
+pkill -f "gz sim -g"
+```
+
+### Orphaned processes after a crash or closing the Gazebo window
+
+Stopping the launch with `Ctrl+C` in its terminal is the reliable shutdown
+path. Closing the Gazebo window directly or killing the terminal can leave
+`gz sim`, `perception_node`, or `controller_node` running, and those processes
+compete with the next launch for the camera and ROS topics. Run the cleanup
+helper before relaunching:
+
+```bash
+~/ros2_ws/src/clean_launch.sh
+```
+
+### WSL2 camera passthrough disappeared
+
+If `lsusb` shows only root hubs and `/dev/video*` does not exist, the webcam
+was detached from WSL. In Windows PowerShell (Admin):
+
+```powershell
+usbipd list
+usbipd attach --wsl --busid <BUSID>
+```
+
+Then verify inside WSL:
+
+```bash
+ls -l /dev/video*
+v4l2-ctl --list-devices
+```
+
 ### Robot spawns but falls through ground
 ```bash
 # Check world file has ground plane
