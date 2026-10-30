@@ -49,7 +49,9 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
         "numpy<2" \
         "opencv-python<4.12" \
         "ultralytics==8.4.142" \
-        "supervision==0.30.2"
+        "supervision==0.30.2" \
+        "flake8==7.0.0" \
+        "pytest-cov==5.0.0"
 
 WORKDIR /ros2_ws
 
