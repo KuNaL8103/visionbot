@@ -48,3 +48,7 @@ src/ros_tutorials/
 
 # Local Claude Code instructions
 **/CLAUDE.md
+
+# Keep README.md as the only committed Markdown document
+*.md
+!README.md

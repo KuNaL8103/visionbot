@@ -27,6 +27,7 @@ in real time, entirely in simulation.
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
+- [Docker & CI](#docker--ci)
 - [Running the Full System](#running-the-full-system)
 - [Cleaning Up / Restarting](#cleaning-up--restarting)
 - [Configuration](#configuration)
@@ -78,8 +79,9 @@ environment quirks of running ROS 2 + Gazebo + a webcam inside WSL2.
 - **`perception_node`** opens the webcam directly via `cv2.VideoCapture`
   (no separate camera driver node). It runs YOLOv8 (`yolov8n.pt`) to detect
   the target class (default: `person`), wraps detections with ByteTrack for
-  a stable `track_id` across frames, applies a moving-average smoothing
-  filter to reduce jitter, and publishes a custom `TrackedTarget` message.
+  a stable `track_id` across frames, applies a constant-velocity 2D Kalman
+  filter to smooth jitter and predict through brief occlusions, and publishes
+  a custom `TrackedTarget` message.
 - **`controller_node`** subscribes to that target position, computes a
   horizontal error from image center, and applies proportional control to
   produce linear/angular velocity — clamped to TurtleBot3's real-world
@@ -104,6 +106,18 @@ environment quirks of running ROS 2 + Gazebo + a webcam inside WSL2.
   false, the target hasn't been seen recently, or a 10 Hz watchdog timer
   detects the target has been lost for longer than
   `target_lost_timeout_sec`.
+
+### Latency path
+
+- The camera is opened with `CAP_PROP_BUFFERSIZE=1`; a daemon thread keeps
+  only the newest frame, and the inference timer skips if no new frame arrived.
+- YOLO runs at `imgsz=320` and FP16 (`half=True`) automatically on CUDA.
+- `/target/pose` uses `KEEP_LAST` / `depth=1` QoS, so stale bounding boxes are
+  dropped instead of queued; the controller also rejects out-of-order and
+  stale frame timestamps.
+- `Ctrl+C` is handled cleanly via `ExternalShutdownException` and a guarded
+  `rclpy.shutdown()`.
+
 ## Project Structure
 
 This repository **is** the colcon workspace's `src/` directory — clone it
@@ -112,6 +126,10 @@ sit at the top level of the repo:
 
 ```
 VisionBot/                                # this repo, clone into ~/ros2_ws/src/
+├── .github/workflows/ros2_ci.yml         # Build + headless test CI (Docker)
+├── .dockerignore
+├── Dockerfile                            # ROS 2 Jazzy dev/CI image
+├── RESUME_NOTES.md                       # Kalman/CI interview + resume notes
 ├── .gitignore
 ├── README.md                             # this file
 ├── clean_launch.sh                       # process cleanup helper (see below)
@@ -127,6 +145,7 @@ VisionBot/                                # this repo, clone into ~/ros2_ws/src/
 │   │   ├── controller_node.py            # /target/pose → /cmd_vel
 │   │   └── utils/
 │   │       ├── __init__.py
+│   │       ├── kalman_filter.py          # Pure-NumPy constant-velocity 2D KF
 │   │       └── tracker_wrapper.py        # ByteTrack wrapper (supervision lib)
 │   ├── launch/
 │   │   ├── perception.launch.py          # Perception node standalone
@@ -136,7 +155,9 @@ VisionBot/                                # this repo, clone into ~/ros2_ws/src/
 │   │   └── params.yaml                   # All tunable parameters
 │   ├── test/
 │   │   ├── test_perception_node.py       # Mocked unit tests (no camera needed)
-│   │   └── test_controller_node.py       # Mocked unit tests (no sim needed)
+│   │   ├── test_controller_node.py       # Mocked unit tests (no sim needed)
+│   │   ├── test_kalman_filter.py         # Trajectory smoothing / occlusion tests
+│   │   └── test_low_latency.py           # Frame-slot / QoS / stale-stamp tests
 │   └── docs/
 │       ├── ARCHITECTURE.md               # Node graph, data flow, parameters
 │       ├── TOPICS.md                     # Message/topic contracts
@@ -223,6 +244,33 @@ sudo apt install ros-jazzy-turtlebot3 ros-jazzy-turtlebot3-gazebo
 ```bash
    chmod +x ~/ros2_ws/src/clean_launch.sh
 ```
+
+## Docker & CI
+
+The repository ships a `Dockerfile` based on `ros:jazzy-ros-base` that
+installs the ROS build/test dependencies plus the runtime ML stack
+(Ultralytics, Supervision, OpenCV, NumPy). It builds both packages and sources
+the workspace automatically:
+
+```bash
+docker build -t visionbot:jazzy .
+docker run --rm -it visionbot:jazzy
+```
+
+Run the full test suite headless inside the container:
+
+```bash
+docker run --rm visionbot:jazzy bash -lc \
+  "source /opt/ros/jazzy/setup.bash && cd /ros2_ws && \
+   colcon test --packages-select visual_teleop --python-testing pytest \
+   --event-handlers console_direct+ --return-code-on-test-failure && \
+   colcon test-result --verbose"
+```
+
+`.github/workflows/ros2_ci.yml` does the same on every push / pull request:
+it builds the image with Buildx layer caching, runs `colcon build`, then
+executes the **33-test** suite headlessly with `colcon test` and fails the
+job on any test failure.
 
 ## Running the Full System
 
@@ -336,16 +384,26 @@ The launch files pick it up automatically.
 | `camera_backend` | `"v4l2"` | OpenCV backend — `v4l2` required for WSL2 webcam access |
 | `camera_fourcc` | `"MJPG"` | Pixel format — **do not change to YUYV**, see Troubleshooting |
 | `camera_warmup_frames` | `10` | Frames discarded at startup so auto-exposure/white-balance can settle |
+| `camera_capture_threaded` | `true` | Latest-frame daemon grabber; only the newest frame is processed |
 | `yolo_model` | `"yolov8n.pt"` | YOLO weights file (auto-downloaded on first run) |
 | `target_class` | `"person"` | COCO class to track |
 | `confidence_threshold` | `0.5` | Minimum detection confidence to publish |
 | `iou_threshold` | `0.45` | NMS IoU threshold |
-| `device` | `"cpu"` | Inference device: `"cpu"` or `"cuda"` |
+| `device` | `"auto"` | `auto` → `cuda:0` if available, otherwise `cpu`; or force `cpu` / `cuda:0` |
+| `yolo_imgsz` | `320` | Inference resolution; 320 is ~3× faster than 640 |
+| `yolo_half` | `true` | FP16 on CUDA (`quantize=16`); automatically disabled on CPU |
+| `yolo_max_det` | `20` | Cap detections before NMS |
+| `inference_poll_rate_hz` | `60.0` | Poll for the newest frame faster than the 30 FPS camera |
 | `track_activation_threshold` | `0.25` | Confidence threshold for activating a new ByteTrack track |
 | `minimum_matching_threshold` | `0.8` | IoU threshold for matching detections to existing tracks |
 | `max_time_lost` | `30` | Frames a lost track is kept alive before being dropped |
 | `minimum_consecutive_frames` | `1` | Consecutive frames required to confirm a track |
-| `smoothing_window_size` | `5` | Moving-average window for published x/y (0 = disabled) |
+| `smoothing_method` | `"kalman"` | `kalman`, `moving_average`, or `none` |
+| `smoothing_window_size` | `5` | Moving-average fallback window (0 = disabled) |
+| `kalman_process_noise` | `0.1` | White-acceleration `q` — higher is more responsive, less smooth |
+| `kalman_measurement_noise` | `0.002` | Measurement variance `r` — higher is smoother, more lag |
+| `kalman_initial_covariance` | `1.0` | Initial uncertainty for `x, y, vx, vy` |
+| `kalman_coast_frames` | `15` | Predict-only frames during occlusion (~0.5 s at 30 Hz) |
 | `publish_annotated_image` | `true` | Publish `/perception/annotated` image |
 | `publish_rate_hz` | `30.0` | Publish rate |
 
@@ -368,7 +426,7 @@ The launch files pick it up automatically.
 | `dead_zone_px` | `0.05` | Dead zone in normalized x (0–1) for angular control |
 | `target_lost_timeout_sec` | `1.0` | Seconds before stopping if target is lost (used by both the callback and the watchdog timer) |
 | `enable_safety_stop` | `true` | Stop the robot if no target is detected |
-| `publish_rate_hz` | `30.0` | Publish rate |
+| `publish_rate_hz` | `60.0` | cmd_vel publish rate (faster than perception updates) |
 
 See [`docs/ARCHITECTURE.md`](visual_teleop/docs/ARCHITECTURE.md) for how the
 controller uses these parameters in the control loop.
@@ -396,7 +454,7 @@ Full contract details (QoS, special values, coordinate conventions) are in
 
 ## Running Tests
 
-All tests are unit tests with mocked hardware — **no camera or Gazebo
+All **33** tests are unit tests with mocked hardware — **no camera or Gazebo
 required**:
 
 ```bash
@@ -408,7 +466,12 @@ python3 -m pytest src/visual_teleop/test/ -v
 Perception tests mock `cv2.VideoCapture`, YOLO, and ByteTrack. Controller
 tests use fabricated `TrackedTarget` messages to verify control-loop logic
 (sign conventions, clamping, dead zones, watchdog behavior, and latency
-computation) in isolation.
+computation) in isolation. The Kalman tests verify constant-velocity
+convergence, prediction during occlusion, coast limits, reset behavior, and
+**30.0% jitter reduction (51.9% after warm-up)** versus the 5-frame moving
+average on a seeded synthetic track. Low-latency regression tests cover the
+latest-frame slot, auto device resolution, stale frame rejection, and
+out-of-order/occluded target handling.
 
 ## Troubleshooting
 

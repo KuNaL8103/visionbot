@@ -12,13 +12,18 @@ perception_node:
     camera_backend: "v4l2"             # Backend: v4l2 (required for webcam access in WSL2)
     camera_fourcc: "MJPG"              # FourCC format: MJPG (YUYV produces corrupted frames in this env)
     camera_warmup_frames: 10           # Frames to discard for auto-exposure/white-balance settle
+    camera_capture_threaded: true      # Latest-frame grabber (false = synchronous read in timer)
 
     # YOLO settings
     yolo_model: "yolov8n.pt"           # YOLO model file (downloaded auto)
     target_class: "person"             # COCO class name to track
     confidence_threshold: 0.5          # Detection confidence threshold
     iou_threshold: 0.45                # NMS IoU threshold
-    device: "cpu"                      # Inference device: "cpu" or "cuda"
+    device: "auto"                     # auto -> cuda:0 if available, else cpu
+    yolo_imgsz: 320                    # Inference resolution (256/320 are good latency/accuracy tradeoffs)
+    yolo_half: true                    # FP16 on CUDA; automatically disabled on CPU
+    yolo_max_det: 20                   # Cap detections before NMS
+    inference_poll_rate_hz: 60.0       # Poll for newest frame faster than the 30 FPS camera
 
     # ByteTrack settings
     track_activation_threshold: 0.25   # Confidence threshold for activating new tracks
@@ -26,8 +31,15 @@ perception_node:
     max_time_lost: 30                  # Max frames to keep lost track alive
     minimum_consecutive_frames: 1      # Min consecutive frames to confirm a track
 
-    # Smoothing filter (moving average)
-    smoothing_window_size: 5           # Number of frames for moving average (default 5, 0=disabled)
+    # Smoothing filter
+    smoothing_method: "kalman"         # kalman (default), moving_average, or none
+    smoothing_window_size: 5           # Moving-average fallback window (0=disabled)
+
+    # Constant-velocity Kalman filter (pure NumPy)
+    kalman_process_noise: 0.1          # White-acceleration q: higher = more responsive, less smooth
+    kalman_measurement_noise: 0.002    # Measurement variance r: higher = more smoothing
+    kalman_initial_covariance: 1.0     # Initial uncertainty for x, y, vx, vy
+    kalman_coast_frames: 15            # Predict-only frames during occlusion (~0.5 s at 30 Hz, below 1 s watchdog)
 
     # Output
     publish_annotated_image: true      # Publish /perception/annotated image
@@ -54,4 +66,4 @@ controller_node:
     enable_safety_stop: true           # Stop robot if no target detected
 
     # Output
-    publish_rate_hz: 30.0              # Hz
+    publish_rate_hz: 60.0              # Hz - dispatch cmd_vel faster than perception updates

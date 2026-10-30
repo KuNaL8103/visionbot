@@ -1,0 +1,33 @@
+# Build / runtime artifacts
+build/
+install/
+log/
+*.bundle
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Model weights / datasets
+*.pt
+*.onnx
+*.engine
+*.db
+*.db-journal
+
+# IDE and VCS metadata
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local environment
+.env
+.venv/
+venv/
+env/

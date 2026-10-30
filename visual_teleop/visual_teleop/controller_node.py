@@ -11,10 +11,19 @@ target_lost_timeout_sec, and latency logging from frame timestamp.
 """
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from visual_teleop_msgs.msg import TrackedTarget
 from geometry_msgs.msg import Twist, TwistStamped
-from builtin_interfaces.msg import Time
+
+
+# Match perception_node: only the newest target matters for control.
+TARGET_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+)
 
 
 class ControllerNode(Node):
@@ -33,7 +42,7 @@ class ControllerNode(Node):
         self.declare_parameter('dead_zone_px', 0.05)  # dead zone in normalized x (0-1)
         self.declare_parameter('target_lost_timeout_sec', 1.0)  # seconds - watchdog timeout for zero Twist
         self.declare_parameter('enable_safety_stop', True)
-        self.declare_parameter('publish_rate_hz', 30.0)
+        self.declare_parameter('publish_rate_hz', 60.0)  # Faster cmd_vel dispatch
 
         # Get parameter values
         self.linear_gain = self.get_parameter('linear_gain').get_parameter_value().double_value
@@ -59,12 +68,12 @@ class ControllerNode(Node):
         self.get_logger().info(f'  enable_safety_stop: {self.enable_safety_stop}')
         self.get_logger().info(f'  publish_rate_hz: {self.publish_rate_hz}')
 
-        # Subscriber to target pose
+        # Subscriber to target pose (depth=1 drops stale queued targets).
         self.target_sub = self.create_subscription(
             TrackedTarget,
             '/target/pose',
             self.target_callback,
-            10
+            TARGET_QOS
         )
 
         # Publisher for cmd_vel (Gazebo bridge expects TwistStamped)
@@ -82,8 +91,21 @@ class ControllerNode(Node):
         # Watchdog timer: publishes zero Twist if target lost for longer than target_lost_timeout_sec
         self.watchdog_timer = self.create_timer(0.1, self.watchdog_callback)  # 10 Hz check
 
+    @staticmethod
+    def _stamp_ns(stamp) -> int:
+        """Convert a builtin_interfaces/Time message to nanoseconds."""
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
     def target_callback(self, msg: TrackedTarget):
-        """Callback for target pose messages."""
+        """Callback for target pose messages, dropping out-of-order samples."""
+        new_stamp_ns = self._stamp_ns(msg.stamp)
+        if self.latest_target is not None:
+            old_stamp_ns = self._stamp_ns(self.latest_target.stamp)
+            if new_stamp_ns > 0 and old_stamp_ns > 0 and new_stamp_ns < old_stamp_ns:
+                self.get_logger().debug(
+                    'Dropping out-of-order target message (older frame stamp)')
+                return
+
         self.latest_target = msg
         self.last_target_time = self.get_clock().now()
 
@@ -125,12 +147,15 @@ class ControllerNode(Node):
 
         # Check if we have a recent target
         if self.latest_target is None:
+            self.last_latency_sec = None
             if self.enable_safety_stop:
                 self.get_logger().debug('No target received yet, publishing zero velocity')
             return twist_stamped
 
         # Check if target is visible
         if not self.latest_target.target_visible:
+            # Never accumulate latency from occluded/coasting frames.
+            self.last_latency_sec = None
             if self.enable_safety_stop:
                 self.get_logger().debug('Target not visible, publishing zero velocity')
             return twist_stamped
@@ -139,8 +164,25 @@ class ControllerNode(Node):
         if self.last_target_time is not None:
             elapsed = (now - self.last_target_time).nanoseconds / 1e9
             if elapsed > self.target_lost_timeout_sec:
+                self.last_latency_sec = None
                 if self.enable_safety_stop:
                     self.get_logger().debug(f'Target timeout ({elapsed:.2f}s), publishing zero velocity')
+                return twist_stamped
+
+        # Reject a message that arrived on time but carries a stale frame stamp
+        # (e.g. a queued frame from before the capture-thread fix). Stamp 0 is
+        # treated as "not provided" for compatibility with synthetic messages.
+        frame_stamp_ns = self._stamp_ns(self.latest_target.stamp)
+        frame_age_sec = None
+        if frame_stamp_ns > 0:
+            frame_time = rclpy.time.Time.from_msg(self.latest_target.stamp)
+            frame_age_sec = (now - frame_time).nanoseconds / 1e9
+            if frame_age_sec < 0.0 or frame_age_sec > self.target_lost_timeout_sec:
+                self.last_latency_sec = None
+                self.get_logger().warn(
+                    f'Ignoring stale frame stamp ({frame_age_sec * 1000:.1f}ms old)',
+                    throttle_duration_sec=2.0,
+                )
                 return twist_stamped
 
         # Extract target position (normalized 0-1)
@@ -179,27 +221,31 @@ class ControllerNode(Node):
 
         twist_stamped.twist = twist
 
-        # Latency logging: time from frame capture (msg.stamp) to Twist publish
-        if self.latest_target is not None and self.latest_target.stamp is not None:
-            try:
-                frame_time = rclpy.time.Time.from_msg(self.latest_target.stamp)
-                latency_ns = (now - frame_time).nanoseconds
-                latency_sec = latency_ns / 1e9
-                self.last_latency_sec = latency_sec
-                latency_ms = latency_sec * 1000
-                self.get_logger().info(f'Latency: {latency_ms:.1f}ms (frame->cmd_vel)', throttle_duration_sec=2.0)
-            except Exception:
-                # Ignore timestamp conversion errors
-                self.last_latency_sec = None
+        # Latency logging: time from frame capture (msg.stamp) to Twist publish.
+        # Only visible, fresh frames reach this point; occluded/coasting frames
+        # return early and never contribute a fake 3000ms sample.
+        if frame_age_sec is not None:
+            self.last_latency_sec = frame_age_sec
+            self.get_logger().info(
+                f'Latency: {frame_age_sec * 1000:.1f}ms (frame->cmd_vel)',
+                throttle_duration_sec=2.0,
+            )
+        else:
+            self.last_latency_sec = None
 
         return twist_stamped
 
     def destroy_node(self):
-        # Publish zero velocity on shutdown
-        zero_twist = TwistStamped()
-        zero_twist.header.stamp = self.get_clock().now().to_msg()
-        zero_twist.header.frame_id = 'base_link'
-        self.cmd_vel_pub.publish(zero_twist)
+        # Publish zero velocity on shutdown, but never crash if the ROS context
+        # was already shut down by Ctrl+C / the signal handler.
+        if rclpy.ok():
+            try:
+                zero_twist = TwistStamped()
+                zero_twist.header.stamp = self.get_clock().now().to_msg()
+                zero_twist.header.frame_id = 'base_link'
+                self.cmd_vel_pub.publish(zero_twist)
+            except Exception:
+                pass
         super().destroy_node()
 
 
@@ -208,11 +254,14 @@ def main(args=None):
     node = ControllerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':

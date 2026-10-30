@@ -1,0 +1,64 @@
+name: ROS 2 Jazzy CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ros2-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build workspace and run tests (headless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ROS 2 Jazzy image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: visionbot:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: colcon build + colcon test inside container
+        run: |
+          docker run --rm \
+            -e ROS_DOMAIN_ID=42 \
+            -e QT_QPA_PLATFORM=offscreen \
+            -e SDL_VIDEODRIVER=dummy \
+            visionbot:ci \
+            bash -lc '
+              set -eo pipefail
+              source /opt/ros/jazzy/setup.bash
+              cd /ros2_ws
+
+              colcon build --symlink-install \
+                --packages-select visual_teleop_msgs visual_teleop \
+                --event-handlers console_direct+
+
+              source install/setup.bash
+
+              colcon test \
+                --packages-select visual_teleop \
+                --python-testing pytest \
+                --event-handlers console_direct+ \
+                --return-code-on-test-failure
+
+              colcon test-result --verbose
+            '

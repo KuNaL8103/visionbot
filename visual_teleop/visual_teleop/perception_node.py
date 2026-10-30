@@ -2,28 +2,88 @@
 """
 Perception Node - YOLO Detection + ByteTrack
 
-Opens webcam using OpenCV VideoCapture, runs YOLOv8 detection on each frame,
-uses ByteTrack to maintain stable track IDs across frames, publishes
-TrackedTarget with normalized bbox center of highest-confidence detection
-for the configured target_class.
+Opens the webcam with a low-latency latest-frame capture thread, runs YOLOv8
+detection on the newest frame, uses ByteTrack to maintain stable track IDs
+across frames, and publishes TrackedTarget with the normalized bbox center of
+the highest-confidence detection for the configured target_class.
 
-Includes moving-average filter (parameterizable window size) to smooth
-published x/y coordinates while keeping target_visible raw per-frame.
+A constant-velocity Kalman filter smooths x/y and predicts through brief
+occlusions. The 5-frame moving average remains available as a fallback.
 """
 
+import threading
+import time
+
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from visual_teleop_msgs.msg import TrackedTarget
-from builtin_interfaces.msg import Time
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from visual_teleop.utils.tracker_wrapper import TrackerWrapper
+from visual_teleop.utils.kalman_filter import KalmanFilter2D
 from collections import deque
+
+
+# Low-latency target stream: keep only the newest sample and never queue old
+# bounding boxes behind a slow controller/inference cycle.
+TARGET_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+)
 
 
 class PerceptionNode(Node):
     """Node for publishing YOLO-detected target position."""
+
+    @staticmethod
+    def _resolve_device(requested_device: str):
+        """Resolve 'auto' (or an unavailable CUDA device) to a usable device."""
+        requested = (requested_device or 'auto').lower()
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+
+        if requested == 'auto':
+            return ('cuda:0' if cuda_available else 'cpu'), cuda_available
+        if requested.startswith('cuda') and not cuda_available:
+            return 'cpu', False
+        return requested, cuda_available
+
+    def _inference_kwargs(self):
+        """Build YOLO kwargs once per call, including the correct FP16 flag."""
+        kwargs = {
+            'verbose': False,
+            'conf': self.confidence_threshold,
+            'iou': self.iou_threshold,
+            'device': self.device,
+            'imgsz': self.yolo_imgsz,
+            'max_det': self.yolo_max_det,
+        }
+        if self.target_class_idx is not None:
+            kwargs['classes'] = [self.target_class_idx]
+        if self.use_half:
+            # Ultralytics >= 8.4 uses quantize=16; older versions use half=True.
+            kwargs[self._fp16_arg] = 16 if self._fp16_arg == 'quantize' else True
+        return kwargs
+
+    def _warmup_inference(self):
+        """Run one dummy inference so CUDA/JIT/NMS setup cost is paid at startup."""
+        if self.model is None:
+            return
+        dummy = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+        started = time.perf_counter()
+        try:
+            self.model(dummy, **self._inference_kwargs())
+            warmup_ms = (time.perf_counter() - started) * 1000.0
+            self.get_logger().info(f'YOLO warmup complete: {warmup_ms:.1f}ms')
+        except Exception as exc:
+            self.get_logger().warn(f'YOLO warmup skipped: {exc}')
 
     def __init__(self):
         super().__init__('perception_node')
@@ -36,12 +96,17 @@ class PerceptionNode(Node):
         self.declare_parameter('camera_backend', 'v4l2')  # v4l2, any, gstreamer, ffmpeg
         self.declare_parameter('camera_fourcc', 'MJPG')   # MJPG (default — YUYV causes corrupted frames on this hardware, see TROUBLESHOOTING.md)
         self.declare_parameter('camera_warmup_frames', 10)  # Frames to discard for auto-exposure settle
+        self.declare_parameter('camera_capture_threaded', True)  # Latest-frame grabber
         self.declare_parameter('publish_rate_hz', 30.0)
         self.declare_parameter('yolo_model', 'yolov8n.pt')
         self.declare_parameter('target_class', 'person')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('iou_threshold', 0.45)
-        self.declare_parameter('device', 'cpu')
+        self.declare_parameter('device', 'auto')  # auto, cpu, cuda, cuda:0, ...
+        self.declare_parameter('yolo_imgsz', 320)  # Inference resolution (320 is ~3x faster than 640)
+        self.declare_parameter('yolo_half', True)  # FP16 on CUDA only
+        self.declare_parameter('yolo_max_det', 20)  # Cap boxes before NMS
+        self.declare_parameter('inference_poll_rate_hz', 60.0)  # Poll latest frame faster than the camera
         self.declare_parameter('show_debug_window', False)
         # ByteTrack parameters
         self.declare_parameter('track_activation_threshold', 0.25)
@@ -49,8 +114,14 @@ class PerceptionNode(Node):
         self.declare_parameter('max_time_lost', 30)
         self.declare_parameter('minimum_consecutive_frames', 1)
 
-        # Smoothing filter (moving average) parameters
-        self.declare_parameter('smoothing_window_size', 5)  # Number of frames for moving average, 0=disabled
+        # Smoothing filter parameters
+        self.declare_parameter('smoothing_method', 'kalman')  # kalman, moving_average, none
+        self.declare_parameter('smoothing_window_size', 5)  # Moving-average window, 0=disabled
+        # Constant-velocity Kalman filter (pure NumPy)
+        self.declare_parameter('kalman_process_noise', 0.1)        # White-acceleration q
+        self.declare_parameter('kalman_measurement_noise', 0.002)  # Measurement variance r
+        self.declare_parameter('kalman_initial_covariance', 1.0)   # Initial state uncertainty
+        self.declare_parameter('kalman_coast_frames', 15)          # Max predict-only frames during occlusion
 
         # Get parameter values
         self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
@@ -60,12 +131,20 @@ class PerceptionNode(Node):
         self.camera_backend = self.get_parameter('camera_backend').get_parameter_value().string_value
         self.camera_fourcc = self.get_parameter('camera_fourcc').get_parameter_value().string_value
         self.camera_warmup_frames = self.get_parameter('camera_warmup_frames').get_parameter_value().integer_value
+        self.camera_capture_threaded = self.get_parameter('camera_capture_threaded').get_parameter_value().bool_value
         self.publish_rate_hz = self.get_parameter('publish_rate_hz').get_parameter_value().double_value
         self.yolo_model_path = self.get_parameter('yolo_model').get_parameter_value().string_value
         self.target_class = self.get_parameter('target_class').get_parameter_value().string_value
         self.confidence_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
         self.iou_threshold = self.get_parameter('iou_threshold').get_parameter_value().double_value
-        self.device = self.get_parameter('device').get_parameter_value().string_value
+        requested_device = self.get_parameter('device').get_parameter_value().string_value
+        self.yolo_imgsz = self.get_parameter('yolo_imgsz').get_parameter_value().integer_value
+        self.yolo_half_requested = self.get_parameter('yolo_half').get_parameter_value().bool_value
+        self.yolo_max_det = self.get_parameter('yolo_max_det').get_parameter_value().integer_value
+        self.inference_poll_rate_hz = self.get_parameter('inference_poll_rate_hz').get_parameter_value().double_value
+        self.device, cuda_available = self._resolve_device(requested_device)
+        self.use_half = bool(self.yolo_half_requested and cuda_available)
+        self.last_inference_ms = None
         self.show_debug_window = self.get_parameter('show_debug_window').get_parameter_value().bool_value
         # ByteTrack parameters
         self.track_activation_threshold = self.get_parameter('track_activation_threshold').get_parameter_value().double_value
@@ -74,11 +153,39 @@ class PerceptionNode(Node):
         self.minimum_consecutive_frames = self.get_parameter('minimum_consecutive_frames').get_parameter_value().integer_value
 
         # Smoothing filter parameters
+        self.smoothing_method = self.get_parameter('smoothing_method').get_parameter_value().string_value.lower()
         self.smoothing_window_size = self.get_parameter('smoothing_window_size').get_parameter_value().integer_value
+        self.kalman_process_noise = self.get_parameter('kalman_process_noise').get_parameter_value().double_value
+        self.kalman_measurement_noise = self.get_parameter('kalman_measurement_noise').get_parameter_value().double_value
+        self.kalman_initial_covariance = self.get_parameter('kalman_initial_covariance').get_parameter_value().double_value
+        self.kalman_coast_frames = self.get_parameter('kalman_coast_frames').get_parameter_value().integer_value
 
-        # Initialize smoothing buffers
-        self.smoothing_buffer_x = deque(maxlen=self.smoothing_window_size) if self.smoothing_window_size > 0 else None
-        self.smoothing_buffer_y = deque(maxlen=self.smoothing_window_size) if self.smoothing_window_size > 0 else None
+        if self.smoothing_method not in ('kalman', 'moving_average', 'none'):
+            self.get_logger().warn(
+                f'Unknown smoothing_method "{self.smoothing_method}", falling back to "none"')
+            self.smoothing_method = 'none'
+
+        # Initialize smoothing buffers (moving-average fallback / comparison mode).
+        self.smoothing_buffer_x = None
+        self.smoothing_buffer_y = None
+        if self.smoothing_method == 'moving_average' and self.smoothing_window_size > 0:
+            self.smoothing_buffer_x = deque(maxlen=self.smoothing_window_size)
+            self.smoothing_buffer_y = deque(maxlen=self.smoothing_window_size)
+
+        # Constant-velocity Kalman filter (pure NumPy). A single filter is used
+        # because the perception node publishes only the best (highest-confidence)
+        # target at a time; ByteTrack handles identity across detections.
+        self.kalman_filter = None
+        if self.smoothing_method == 'kalman':
+            filter_dt = 1.0 / self.publish_rate_hz if self.publish_rate_hz > 0.0 else 1.0 / 30.0
+            self.kalman_filter = KalmanFilter2D(
+                process_noise=self.kalman_process_noise,
+                measurement_noise=self.kalman_measurement_noise,
+                dt=filter_dt,
+                initial_covariance=self.kalman_initial_covariance,
+                max_coast_frames=self.kalman_coast_frames,
+            )
+        self.last_track_id = None
 
         self.get_logger().info(f'Perception node initialized')
         self.get_logger().info(f'  camera_index: {self.camera_index}')
@@ -88,23 +195,45 @@ class PerceptionNode(Node):
         self.get_logger().info(f'  camera_backend: {self.camera_backend}')
         self.get_logger().info(f'  camera_fourcc: {self.camera_fourcc}')
         self.get_logger().info(f'  camera_warmup_frames: {self.camera_warmup_frames}')
+        self.get_logger().info(f'  camera_capture_threaded: {self.camera_capture_threaded}')
         self.get_logger().info(f'  publish_rate_hz: {self.publish_rate_hz}')
         self.get_logger().info(f'  yolo_model: {self.yolo_model_path}')
         self.get_logger().info(f'  target_class: {self.target_class}')
         self.get_logger().info(f'  confidence_threshold: {self.confidence_threshold}')
         self.get_logger().info(f'  iou_threshold: {self.iou_threshold}')
         self.get_logger().info(f'  device: {self.device}')
+        self.get_logger().info(f'  yolo_imgsz: {self.yolo_imgsz}')
+        self.get_logger().info(f'  yolo_half: {self.use_half}')
+        self.get_logger().info(f'  yolo_max_det: {self.yolo_max_det}')
+        self.get_logger().info(f'  inference_poll_rate_hz: {self.inference_poll_rate_hz}')
         self.get_logger().info(f'  show_debug_window: {self.show_debug_window}')
         self.get_logger().info(f'  track_activation_threshold: {self.track_activation_threshold}')
         self.get_logger().info(f'  minimum_matching_threshold: {self.minimum_matching_threshold}')
         self.get_logger().info(f'  max_time_lost: {self.max_time_lost}')
         self.get_logger().info(f'  minimum_consecutive_frames: {self.minimum_consecutive_frames}')
+        self.get_logger().info(f'  smoothing_method: {self.smoothing_method}')
         self.get_logger().info(f'  smoothing_window_size: {self.smoothing_window_size}')
+        if self.kalman_filter is not None:
+            self.get_logger().info(f'  kalman_process_noise: {self.kalman_process_noise}')
+            self.get_logger().info(f'  kalman_measurement_noise: {self.kalman_measurement_noise}')
+            self.get_logger().info(f'  kalman_initial_covariance: {self.kalman_initial_covariance}')
+            self.get_logger().info(f'  kalman_coast_frames: {self.kalman_coast_frames}')
 
         # Load YOLO model
         self.get_logger().info(f'Loading YOLO model: {self.yolo_model_path}')
         self.model = YOLO(self.yolo_model_path)
         self.model.to(self.device)
+        # Fuse Conv+BN layers when supported (typically a small speedup).
+        try:
+            self.model.fuse()
+        except Exception:
+            pass
+        # Pick the precision kwarg supported by this ultralytics release.
+        try:
+            from ultralytics.cfg import DEFAULT_CFG_DICT
+            self._fp16_arg = 'quantize' if 'quantize' in DEFAULT_CFG_DICT else 'half'
+        except Exception:
+            self._fp16_arg = 'half'
         # Get class names from model
         self.class_names = self.model.names
         self.get_logger().info(f'YOLO model loaded. Classes: {self.class_names}')
@@ -120,6 +249,9 @@ class PerceptionNode(Node):
         else:
             self.get_logger().info(f'Target class "{self.target_class}" has index {self.target_class_idx}')
 
+        # Pay the first-call CUDA/JIT/NMS cost before the control loop starts.
+        self._warmup_inference()
+
         # Initialize ByteTrack tracker
         self.tracker = TrackerWrapper(
             track_activation_threshold=self.track_activation_threshold,
@@ -128,6 +260,16 @@ class PerceptionNode(Node):
             minimum_consecutive_frames=self.minimum_consecutive_frames
         )
         self.get_logger().info('ByteTrack tracker initialized')
+
+        # Latest-frame capture state. Only one frame is retained; old frames
+        # are overwritten rather than queued.
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_frame_stamp = None
+        self._frame_seq = 0
+        self._processed_frame_seq = 0
+        self._capture_stop = threading.Event()
+        self._capture_thread = None
 
         # Open webcam with specified backend
         backend_map = {
@@ -141,6 +283,10 @@ class PerceptionNode(Node):
         if not self.cap.isOpened():
             self.get_logger().warn(f'Could not open camera at index {self.camera_index} with backend {self.camera_backend}')
         else:
+            # Keep only the newest driver buffer. Without this, V4L2 can hand
+            # back frames that were captured hundreds of milliseconds ago.
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
             # Set FourCC format
             fourcc = cv2.VideoWriter_fourcc(*self.camera_fourcc)
             self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
@@ -161,32 +307,95 @@ class PerceptionNode(Node):
                 self.cap.read()
             self.get_logger().info(f'  Camera warmup complete')
 
-        # Publisher for target info
-        self.target_pub = self.create_publisher(TrackedTarget, '/target/pose', 10)
+        # Publisher for target info (depth=1 keeps only the newest target).
+        self.target_pub = self.create_publisher(TrackedTarget, '/target/pose', TARGET_QOS)
 
         # State for holding last known position when target lost
         self.last_x = 0.5
         self.last_y = 0.5
 
-        # Timer for processing loop
-        self.timer = self.create_timer(1.0 / self.publish_rate_hz, self.timer_callback)
+        # The capture thread is started from main() so direct node construction
+        # (unit tests, embedding) remains synchronous unless explicitly started.
+        poll_rate = self.inference_poll_rate_hz if self.inference_poll_rate_hz > 0.0 else self.publish_rate_hz
+        self.timer = self.create_timer(1.0 / poll_rate, self.timer_callback)
+
+    def start_capture_thread(self):
+        """Start the daemon frame grabber (idempotent)."""
+        if self._capture_thread is not None and self._capture_thread.is_alive():
+            return
+        if not self.cap.isOpened():
+            self.get_logger().warn('Not starting capture thread: camera is not open')
+            return
+
+        self._capture_stop.clear()
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name='visionbot_camera_capture',
+            daemon=True,
+        )
+        self._capture_thread.start()
+        self.get_logger().info('Latest-frame capture thread started')
+
+    def _capture_loop(self):
+        """Continuously overwrite the single latest-frame slot."""
+        while not self._capture_stop.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                # Avoid a tight spin if the camera is temporarily unavailable.
+                self._capture_stop.wait(0.01)
+                continue
+
+            stamp = self.get_clock().now().to_msg()
+            with self._frame_lock:
+                self._latest_frame = frame
+                self._latest_frame_stamp = stamp
+                self._frame_seq += 1
+
+    def _take_latest_frame(self):
+        """Return the newest unprocessed frame, or skip if none arrived."""
+        with self._frame_lock:
+            if self._latest_frame is None or self._frame_seq == self._processed_frame_seq:
+                return False, None, None
+            self._processed_frame_seq = self._frame_seq
+            return True, self._latest_frame, self._latest_frame_stamp
 
     def timer_callback(self):
-        """Timer callback: read frame, run YOLO detection, update ByteTrack, publish TrackedTarget."""
-        # Capture timestamp at frame read for latency measurement
-        frame_stamp = self.get_clock().now().to_msg()
+        """Timer callback: process only the newest frame and publish TrackedTarget."""
+        capture_thread_running = (
+            self._capture_thread is not None and self._capture_thread.is_alive()
+        )
 
-        # Read frame
-        ret, frame = self.cap.read()
-        if not ret:
-            self.get_logger().warn('Failed to read frame from camera', throttle_duration_sec=5.0)
-            self._publish_target_visible_false(stamp=frame_stamp)
-            return
+        if capture_thread_running:
+            ret, frame, frame_stamp = self._take_latest_frame()
+            if not ret:
+                # No new frame since the previous tick: never reprocess a stale
+                # frame just to fill the timer period.
+                self.get_logger().debug(
+                    'No new camera frame; skipping inference tick',
+                    throttle_duration_sec=2.0,
+                )
+                return
+        else:
+            # Synchronous fallback for direct node construction/tests and for
+            # platforms where the capture thread could not start.
+            frame_stamp = self.get_clock().now().to_msg()
+            ret, frame = self.cap.read()
+            if not ret:
+                self.get_logger().warn('Failed to read frame from camera', throttle_duration_sec=5.0)
+                self._publish_target_visible_false(stamp=frame_stamp)
+                return
 
         frame_height, frame_width = frame.shape[:2]
 
-        # Run YOLO inference
-        results = self.model(frame, verbose=False, conf=self.confidence_threshold, iou=self.iou_threshold, device=self.device)
+        # Run YOLO inference. The kwargs already include device/imgsz and the
+        # correct FP16 flag for this ultralytics version.
+        inference_started = time.perf_counter()
+        results = self.model(frame, **self._inference_kwargs())
+        self.last_inference_ms = (time.perf_counter() - inference_started) * 1000.0
+        self.get_logger().info(
+            f'Inference: {self.last_inference_ms:.1f}ms ({self.device}, imgsz={self.yolo_imgsz})',
+            throttle_duration_sec=5.0,
+        )
 
         # Collect all target class detections
         boxes_list = []
@@ -234,19 +443,30 @@ class PerceptionNode(Node):
             raw_center_x = (x1 + x2) / 2.0 / frame_width
             raw_center_y = (y1 + y2) / 2.0 / frame_height
 
-            # Apply moving average filter to x/y if enabled
+            # Apply the configured smoothing filter to x/y.
+            # The moving-average branch is kept for comparison/fallback and is
+            # selected whenever its buffers exist.
             if self.smoothing_buffer_x is not None and self.smoothing_buffer_y is not None:
                 self.smoothing_buffer_x.append(raw_center_x)
                 self.smoothing_buffer_y.append(raw_center_y)
-                # Compute moving average
                 smoothed_x = sum(self.smoothing_buffer_x) / len(self.smoothing_buffer_x)
                 smoothed_y = sum(self.smoothing_buffer_y) / len(self.smoothing_buffer_y)
                 msg.x = float(smoothed_x)
                 msg.y = float(smoothed_y)
+            elif self.kalman_filter is not None:
+                # Reset the motion model if ByteTrack assigns a new identity,
+                # so stale velocity from the previous target is not reused.
+                if self.last_track_id is not None and track_id != self.last_track_id:
+                    self.kalman_filter.reset()
+                estimate = self.kalman_filter.update(raw_center_x, raw_center_y)
+                msg.x = float(estimate[0])
+                msg.y = float(estimate[1])
             else:
                 # No smoothing - use raw values
                 msg.x = float(raw_center_x)
                 msg.y = float(raw_center_y)
+
+            self.last_track_id = track_id
 
             msg.confidence = best_confidence
             msg.target_visible = True
@@ -266,7 +486,19 @@ class PerceptionNode(Node):
         self.target_pub.publish(msg)
 
     def _publish_target_visible_false(self, frame=None, stamp=None):
-        """Publish TrackedTarget with target_visible=false, holding last known position."""
+        """Publish TrackedTarget with target_visible=false during an occlusion.
+
+        If the Kalman filter has a state, the position is advanced with a
+        predict-only step so downstream consumers/debug overlays can see where
+        the target is expected to be. ``target_visible`` stays false and the
+        10 Hz safety watchdog still stops the robot after its timeout.
+        """
+        if self.kalman_filter is not None:
+            predicted = self.kalman_filter.predict()
+            if predicted is not None:
+                self.last_x = float(predicted[0])
+                self.last_y = float(predicted[1])
+
         msg = TrackedTarget()
         msg.x = self.last_x
         msg.y = self.last_y
@@ -314,6 +546,11 @@ class PerceptionNode(Node):
         cv2.waitKey(1)
 
     def destroy_node(self):
+        # Stop and join the grabber before touching the capture object.
+        self._capture_stop.set()
+        if self._capture_thread is not None:
+            self._capture_thread.join(timeout=1.0)
+            self._capture_thread = None
         if hasattr(self, 'cap') and self.cap.isOpened():
             self.cap.release()
         if self.show_debug_window:
@@ -324,13 +561,20 @@ class PerceptionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PerceptionNode()
+    # Start the grabber only for real execution (not for tests embedding the
+    # node directly). `ros2 run` also gets it even without params.yaml.
+    if node.camera_capture_threaded:
+        node.start_capture_thread()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':
