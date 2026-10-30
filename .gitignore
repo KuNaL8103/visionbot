@@ -12,10 +12,11 @@ __pycache__/
 .coverage
 htmlcov/
 
-# YOLO weight files (downloaded at runtime)
+# Model weights and backups (downloaded/generated at runtime)
 *.pt
 *.onnx
 *.engine
+*.bundle
 
 # IDE/Editor
 .vscode/
@@ -46,9 +47,7 @@ src/py_srvcli/
 src/examples/
 src/ros_tutorials/
 
-# Local Claude Code instructions
+# Local agent instructions and scratch files
 **/CLAUDE.md
-
-# Keep README.md as the only committed Markdown document
-*.md
-!README.md
+RESUME_NOTES.md
+.verify_ws/

@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""
-Perception Launch File - Placeholder
+"""Launch the VisionBot perception node with the shared parameter file."""
 
-Launches the perception node with camera driver.
-"""
+import os
 
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-import os
-from ament_index_python.packages import get_package_share_directory
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -21,16 +18,13 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'params_file',
             default_value=params_file,
-            description='Path to the ROS2 parameters file to use'
+            description='Path to the ROS 2 parameters file to use',
         ),
-
         Node(
             package='visual_teleop',
             executable='perception_node',
             name='perception_node',
             output='screen',
             parameters=[LaunchConfiguration('params_file')],
-            # TODO: Add camera driver node (v4l2_camera or similar)
-            # TODO: Add image transport if needed
         ),
     ])
