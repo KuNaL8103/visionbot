@@ -54,7 +54,7 @@ jobs:
 
               source install/setup.bash
 
-              (cd src && flake8 --max-line-length=99 \
+              (cd src && python3 -m flake8 --max-line-length=99 \
                 visual_teleop/visual_teleop visual_teleop/test)
 
               colcon test \

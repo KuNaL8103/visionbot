@@ -51,7 +51,8 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
         "ultralytics==8.4.142" \
         "supervision==0.30.2" \
         "flake8==7.0.0" \
-        "pytest-cov==5.0.0"
+        "pytest-cov==5.0.0" \
+    && python3 -m flake8 --version
 
 WORKDIR /ros2_ws
 
