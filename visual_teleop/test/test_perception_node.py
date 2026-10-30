@@ -6,12 +6,17 @@ Tests parameter loading and publish logic with mocked camera.
 """
 
 import unittest
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock
 from collections import deque
-import rclpy
+
+import cv2
 import numpy as np
-from visual_teleop_msgs.msg import TrackedTarget
+import rclpy
+from rclpy.parameter import Parameter
+from sensor_msgs.msg import Image
+
 from visual_teleop.perception_node import PerceptionNode
+from visual_teleop_msgs.msg import TrackedTarget
 
 
 class TestPerceptionNode(unittest.TestCase):
@@ -139,6 +144,8 @@ class TestPerceptionNode(unittest.TestCase):
         self.assertAlmostEqual(msg.x, 200/640, places=4, msg="x should be normalized center of mocked bbox")
         self.assertAlmostEqual(msg.y, 200/480, places=4, msg="y should be normalized center of mocked bbox")
         self.assertAlmostEqual(msg.confidence, 0.8, places=4, msg="confidence should match mocked detection")
+        self.assertAlmostEqual(msg.bbox_height, 200/480, places=4,
+                               msg="bbox_height should be normalized bbox height")
         self.assertTrue(msg.target_visible, "target_visible should be True for detection")
         self.assertEqual(msg.track_id, 1, "track_id should match mocked tracker output")
 
@@ -166,6 +173,35 @@ class TestPerceptionNode(unittest.TestCase):
             self.assertAlmostEqual(msg.confidence, 0.8, places=4)
             self.assertTrue(msg.target_visible)
             self.assertEqual(msg.track_id, 1)
+
+        node.destroy_node()
+
+    def test_publishes_annotated_image(self):
+        """Annotated frames should be published as sensor_msgs/Image."""
+        node = PerceptionNode()
+
+        published_images = []
+        node.annotated_pub.publish = published_images.append
+
+        node.timer_callback()
+
+        self.assertEqual(len(published_images), 1)
+        image = published_images[0]
+        self.assertIsInstance(image, Image)
+        self.assertEqual(image.width, 640)
+        self.assertEqual(image.height, 480)
+        self.assertEqual(image.encoding, 'bgr8')
+
+        node.destroy_node()
+
+    def test_video_file_source_uses_ffmpeg(self):
+        """camera_source should accept a video path and select the FFMPEG backend."""
+        overrides = [Parameter('camera_source', value='demo.mp4')]
+        node = PerceptionNode(parameter_overrides=overrides)
+
+        self.assertEqual(node.camera_source, 'demo.mp4')
+        self.assertTrue(node._is_video_file)
+        self.mock_cap_class.assert_called_once_with('demo.mp4', cv2.CAP_FFMPEG)
 
         node.destroy_node()
 

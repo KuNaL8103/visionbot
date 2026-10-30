@@ -26,27 +26,29 @@ This package implements a visual teleoperation system where a laptop webcam trac
 ## Node Descriptions
 
 ### perception_node
-- **Input**: None (opens webcam directly via `cv2.VideoCapture`)
+- **Input**: Webcam index or video file (`camera_index` / `camera_source`)
 - **Processing**:
-  1. OpenCV VideoCapture (`CAP_PROP_BUFFERSIZE=1`) is drained by a daemon latest-frame thread; the ROS timer processes at most one new frame per tick
+  1. OpenCV VideoCapture (`CAP_PROP_BUFFERSIZE=1`) is drained by a daemon latest-frame thread; the ROS timer processes at most one new frame per tick. Video files are played back at `camera_fps`
   2. YOLOv8 detects objects in frame (`imgsz=320`, FP16 on CUDA)
   3. ByteTrack associates detections across frames
   4. Filter tracks by `target_class` parameter
   5. Select best track (highest confidence)
   6. Apply a constant-velocity 2D Kalman filter to x/y (default; `smoothing_method: "kalman"`) using a 4-state `[x, y, vx, vy]` model. During brief occlusions, predict-only steps coast the estimate for up to `kalman_coast_frames` (default 15) before freezing. A 5-frame moving average remains available as a fallback (`smoothing_method: "moving_average"`)
-  7. Publish `TrackedTarget` with normalized bbox center (x, y in 0..1), confidence, track_id, `target_visible` (raw per-frame), and `stamp` (frame capture time for latency measurement). `target_visible` stays false during occlusion prediction; the controller's 10 Hz watchdog remains the safety authority
-- **Output**: `/target/pose` (visual_teleop_msgs/TrackedTarget)
+  7. Publish `TrackedTarget` with normalized center, normalized bbox height (distance proxy), confidence, track_id, `target_visible`, and `stamp`. `target_visible` stays false during occlusion prediction; the controller's 10 Hz watchdog remains the safety authority
+  8. When `publish_annotated_image` is true, publish an overlay frame on `/perception/annotated` with bbox, track ID, confidence, FPS, inference time, and smoothing method
+- **Outputs**: `/target/pose` (visual_teleop_msgs/TrackedTarget), `/perception/annotated` (sensor_msgs/Image)
 
 ### controller_node
 - **Input**: `/target/pose` (visual_teleop_msgs/TrackedTarget)
 - **Processing**:
   1. Extract target position (x, y normalized, confidence, target_visible, track_id, stamp)
   2. Compute angular error from image center (x - 0.5)
-  3. Apply proportional control for linear/angular velocity
-  4. Clamp to `max_linear_speed` / `max_angular_speed`
-  5. Apply dead zone (`dead_zone_px`)
-  6. Safety (subscription callback + watchdog): publish zero velocity if `target_visible=false` for > `target_lost_timeout_sec` (default 1.0s). The watchdog timer (10 Hz) ensures zero Twist is published even if no new messages arrive.
-  7. **Latency logging**: computes and logs time from frame capture (`msg.stamp`) to Twist publish (~every 2s)
+  3. Apply proportional control for angular velocity
+  4. Hold `target_distance` using normalized bbox height as a pinhole distance proxy (`d ~= 0.5 * target_distance / h`); allow forward and backward motion with `deadband` in meters
+  5. Clamp to `max_linear_speed` / `max_angular_speed`
+  6. Apply dead zone (`dead_zone_px`)
+  7. Safety (subscription callback + watchdog): publish zero velocity if `target_visible=false` for > `target_lost_timeout_sec` (default 1.0s). The watchdog timer (10 Hz) ensures zero Twist is published even if no new messages arrive.
+  8. **Latency logging**: computes and logs time from frame capture (`msg.stamp`) to Twist publish (~every 2s)
 - **Output**: `/cmd_vel` (geometry_msgs/TwistStamped)
 
 ## Data Flow Timing
@@ -69,6 +71,7 @@ All parameters in `config/params.yaml`, loaded via `declare_parameter`.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | camera_index | int | 0 | Video device index (/dev/videoX) |
+| camera_source | string | "" | Optional video file path; overrides camera_index |
 | camera_width | int | 640 | Capture width |
 | camera_height | int | 480 | Capture height |
 | camera_fps | int | 30 | Capture FPS |
@@ -116,5 +119,5 @@ All parameters in `config/params.yaml`, loaded via `declare_parameter`.
 - **Core**: rclpy, std_msgs, sensor_msgs, geometry_msgs, cv_bridge
 - **Perception**: ultralytics (YOLO), opencv-python, supervision (ByteTrack)
 - **Messages**: visual_teleop_msgs (TrackedTarget with stamp field)
-- **Simulation**: turtlebot3_gazebo, gazebo_ros
+- **Simulation**: turtlebot3_gazebo, ros_gz_bridge, ros_gz_sim
 - **Launch**: launch, launch_ros

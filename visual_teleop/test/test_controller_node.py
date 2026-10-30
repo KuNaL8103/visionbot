@@ -38,11 +38,13 @@ class TestControllerNode(unittest.TestCase):
         self.node.destroy_node()
 
     def _create_target(self, x: float, y: float, target_visible: bool = True,
-                       confidence: float = 0.8, track_id: int = 1) -> TrackedTarget:
+                       confidence: float = 0.8, track_id: int = 1,
+                       bbox_height: float = 0.0) -> TrackedTarget:
         """Helper to create a TrackedTarget message."""
         msg = TrackedTarget()
         msg.x = x
         msg.y = y
+        msg.bbox_height = bbox_height
         msg.confidence = confidence
         msg.target_visible = target_visible
         msg.track_id = track_id
@@ -165,6 +167,32 @@ class TestControllerNode(unittest.TestCase):
         self.assertGreater(twist_stamped.twist.linear.x, 0.0)
         # Should have positive angular velocity (turning LEFT/CCW toward target on left)
         self.assertGreater(twist_stamped.twist.angular.z, 0.0)
+
+    def test_distance_hold_backs_up_when_target_is_close(self):
+        """A large bbox height means the target is too close, so linear.x < 0."""
+        target = self._create_target(x=0.5, y=0.5, bbox_height=0.75)
+        self.node.target_callback(target)
+        twist_stamped = self.node.compute_cmd_vel()
+
+        self.assertLess(twist_stamped.twist.linear.x, 0.0)
+        self.assertGreaterEqual(twist_stamped.twist.linear.x, -self.node.max_linear_speed)
+
+    def test_distance_hold_moves_forward_when_target_is_far(self):
+        """A small bbox height means the target is too far, so linear.x > 0."""
+        target = self._create_target(x=0.5, y=0.5, bbox_height=0.25)
+        self.node.target_callback(target)
+        twist_stamped = self.node.compute_cmd_vel()
+
+        self.assertGreater(twist_stamped.twist.linear.x, 0.0)
+        self.assertLessEqual(twist_stamped.twist.linear.x, self.node.max_linear_speed)
+
+    def test_distance_hold_inside_deadband_stops(self):
+        """Distance error inside deadband should produce zero linear velocity."""
+        target = self._create_target(x=0.5, y=0.5, bbox_height=0.55)
+        self.node.target_callback(target)
+        twist_stamped = self.node.compute_cmd_vel()
+
+        self.assertEqual(twist_stamped.twist.linear.x, 0.0)
 
     def test_target_slightly_right_still_moves_forward(self):
         """Target slightly right (within forward-facing range) should still move forward."""

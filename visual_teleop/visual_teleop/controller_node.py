@@ -29,6 +29,9 @@ TARGET_QOS = QoSProfile(
 class ControllerNode(Node):
     """Node for converting target pose to velocity commands."""
 
+    # Calibration for d ~= k / h: choose k so h=0.5 maps to target_distance.
+    REFERENCE_BBOX_HEIGHT = 0.5
+
     def __init__(self):
         super().__init__('controller_node')
 
@@ -137,6 +140,10 @@ class ControllerNode(Node):
         twist_stamped = self.compute_cmd_vel()
         self.cmd_vel_pub.publish(twist_stamped)
 
+    def _distance_from_bbox_height(self, bbox_height: float) -> float:
+        """Estimate distance from normalized bbox height using d ~= k / h (pinhole heuristic)."""
+        return self.target_distance * self.REFERENCE_BBOX_HEIGHT / bbox_height
+
     def compute_cmd_vel(self) -> TwistStamped:
         """Compute velocity command from latest target."""
         now = self.get_clock().now()
@@ -205,13 +212,22 @@ class ControllerNode(Node):
             # Clamp to max angular speed
             angular_vel = max(-self.max_angular_speed, min(self.max_angular_speed, angular_vel))
 
-        # Linear velocity: proportional to distance error (using confidence as proxy for distance)
-        # Higher confidence = closer = smaller bbox = further away in normalized coords
-        # We'll use a simple approach: if target is roughly centered, move forward
-        # Only move forward when error is small (target is in front)
-        if abs(error_x) < 0.3:  # reasonable forward-facing range
+        # Linear velocity: hold target_distance when bbox height is available.
+        # Older/synthetic messages without a height retain the legacy behavior.
+        bbox_height = float(getattr(self.latest_target, 'bbox_height', 0.0))
+        if abs(error_x) < 0.3 and bbox_height > 1e-3:
+            estimated_distance = self._distance_from_bbox_height(bbox_height)
+            distance_error = estimated_distance - self.target_distance
+            if abs(distance_error) <= self.deadband:
+                linear_vel = 0.0
+            else:
+                linear_vel = self.linear_gain * distance_error
+                linear_vel = max(
+                    -self.max_linear_speed,
+                    min(self.max_linear_speed, linear_vel),
+                )
+        elif abs(error_x) < 0.3:
             linear_vel = self.linear_gain
-            # Clamp to max linear speed
             linear_vel = max(0.0, min(self.max_linear_speed, linear_vel))
         else:
             linear_vel = 0.0

@@ -11,19 +11,28 @@ A constant-velocity Kalman filter smooths x/y and predicts through brief
 occlusions. The 5-frame moving average remains available as a fallback.
 """
 
+import os
 import threading
 import time
 
-import rclpy
-from rclpy.executors import ExternalShutdownException
-from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from visual_teleop_msgs.msg import TrackedTarget
 import cv2
 import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import (
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
+from sensor_msgs.msg import Image
 from ultralytics import YOLO
-from visual_teleop.utils.tracker_wrapper import TrackerWrapper
+
 from visual_teleop.utils.kalman_filter import KalmanFilter2D
+from visual_teleop.utils.tracker_wrapper import TrackerWrapper
+from visual_teleop_msgs.msg import TrackedTarget
 from collections import deque
 
 
@@ -55,6 +64,22 @@ class PerceptionNode(Node):
             return 'cpu', False
         return requested, cuda_available
 
+    def _resolve_capture_source(self):
+        """Return (OpenCV source, backend) for a webcam index or video file."""
+        backend_map = {
+            'v4l2': cv2.CAP_V4L2,
+            'any': cv2.CAP_ANY,
+            'gstreamer': cv2.CAP_GSTREAMER,
+            'ffmpeg': cv2.CAP_FFMPEG,
+        }
+        backend = backend_map.get(self.camera_backend.lower(), cv2.CAP_V4L2)
+        source = (self.camera_source or '').strip()
+        if not source:
+            return self.camera_index, backend
+        if source.lstrip('+-').isdigit():
+            return int(source), backend
+        return os.path.expanduser(source), cv2.CAP_FFMPEG
+
     def _inference_kwargs(self):
         """Build YOLO kwargs once per call, including the correct FP16 flag."""
         kwargs = {
@@ -85,11 +110,12 @@ class PerceptionNode(Node):
         except Exception as exc:
             self.get_logger().warn(f'YOLO warmup skipped: {exc}')
 
-    def __init__(self):
-        super().__init__('perception_node')
+    def __init__(self, parameter_overrides=None):
+        super().__init__('perception_node', parameter_overrides=parameter_overrides)
 
         # Declare parameters (loaded from config/params.yaml)
         self.declare_parameter('camera_index', 0)
+        self.declare_parameter('camera_source', '')  # Optional video file path
         self.declare_parameter('camera_width', 640)
         self.declare_parameter('camera_height', 480)
         self.declare_parameter('camera_fps', 30)
@@ -107,6 +133,7 @@ class PerceptionNode(Node):
         self.declare_parameter('yolo_half', True)  # FP16 on CUDA only
         self.declare_parameter('yolo_max_det', 20)  # Cap boxes before NMS
         self.declare_parameter('inference_poll_rate_hz', 60.0)  # Poll latest frame faster than the camera
+        self.declare_parameter('publish_annotated_image', True)
         self.declare_parameter('show_debug_window', False)
         # ByteTrack parameters
         self.declare_parameter('track_activation_threshold', 0.25)
@@ -125,6 +152,7 @@ class PerceptionNode(Node):
 
         # Get parameter values
         self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
+        self.camera_source = self.get_parameter('camera_source').get_parameter_value().string_value
         self.camera_width = self.get_parameter('camera_width').get_parameter_value().integer_value
         self.camera_height = self.get_parameter('camera_height').get_parameter_value().integer_value
         self.camera_fps = self.get_parameter('camera_fps').get_parameter_value().integer_value
@@ -142,9 +170,14 @@ class PerceptionNode(Node):
         self.yolo_half_requested = self.get_parameter('yolo_half').get_parameter_value().bool_value
         self.yolo_max_det = self.get_parameter('yolo_max_det').get_parameter_value().integer_value
         self.inference_poll_rate_hz = self.get_parameter('inference_poll_rate_hz').get_parameter_value().double_value
+        self.publish_annotated_image = (
+            self.get_parameter('publish_annotated_image').get_parameter_value().bool_value
+        )
         self.device, cuda_available = self._resolve_device(requested_device)
         self.use_half = bool(self.yolo_half_requested and cuda_available)
         self.last_inference_ms = None
+        self._fps = 0.0
+        self._last_frame_time = None
         self.show_debug_window = self.get_parameter('show_debug_window').get_parameter_value().bool_value
         # ByteTrack parameters
         self.track_activation_threshold = self.get_parameter('track_activation_threshold').get_parameter_value().double_value
@@ -189,6 +222,7 @@ class PerceptionNode(Node):
 
         self.get_logger().info(f'Perception node initialized')
         self.get_logger().info(f'  camera_index: {self.camera_index}')
+        self.get_logger().info(f'  camera_source: {self.camera_source or "<webcam index>"}')
         self.get_logger().info(f'  camera_width: {self.camera_width}')
         self.get_logger().info(f'  camera_height: {self.camera_height}')
         self.get_logger().info(f'  camera_fps: {self.camera_fps}')
@@ -206,6 +240,7 @@ class PerceptionNode(Node):
         self.get_logger().info(f'  yolo_half: {self.use_half}')
         self.get_logger().info(f'  yolo_max_det: {self.yolo_max_det}')
         self.get_logger().info(f'  inference_poll_rate_hz: {self.inference_poll_rate_hz}')
+        self.get_logger().info(f'  publish_annotated_image: {self.publish_annotated_image}')
         self.get_logger().info(f'  show_debug_window: {self.show_debug_window}')
         self.get_logger().info(f'  track_activation_threshold: {self.track_activation_threshold}')
         self.get_logger().info(f'  minimum_matching_threshold: {self.minimum_matching_threshold}')
@@ -271,17 +306,17 @@ class PerceptionNode(Node):
         self._capture_stop = threading.Event()
         self._capture_thread = None
 
-        # Open webcam with specified backend
-        backend_map = {
-            'v4l2': cv2.CAP_V4L2,
-            'any': cv2.CAP_ANY,
-            'gstreamer': cv2.CAP_GSTREAMER,
-            'ffmpeg': cv2.CAP_FFMPEG,
-        }
-        backend = backend_map.get(self.camera_backend.lower(), cv2.CAP_V4L2)
-        self.cap = cv2.VideoCapture(self.camera_index, backend)
+        # Open a webcam index or a video file (for reproducible demos/tests).
+        capture_source, backend = self._resolve_capture_source()
+        self._is_video_file = isinstance(capture_source, str)
+        self.cap = cv2.VideoCapture(capture_source, backend)
         if not self.cap.isOpened():
-            self.get_logger().warn(f'Could not open camera at index {self.camera_index} with backend {self.camera_backend}')
+            self.get_logger().warn(
+                f'Could not open camera source "{capture_source}" '
+                f'with backend {self.camera_backend}'
+            )
+        elif self._is_video_file:
+            self.get_logger().info(f'  Video source opened: {capture_source}')
         else:
             # Keep only the newest driver buffer. Without this, V4L2 can hand
             # back frames that were captured hundreds of milliseconds ago.
@@ -299,16 +334,26 @@ class PerceptionNode(Node):
             actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
             actual_fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
             fourcc_str = "".join([chr((actual_fourcc >> 8 * i) & 0xFF) for i in range(4)])
-            self.get_logger().info(f'  Camera opened: {int(actual_width)}x{int(actual_height)} @ {actual_fps:.1f} FPS, FourCC: {fourcc_str}')
+            self.get_logger().info(
+                f'  Camera opened: {int(actual_width)}x{int(actual_height)} '
+                f'@ {actual_fps:.1f} FPS, FourCC: {fourcc_str}'
+            )
 
             # Warmup: discard frames to let auto-exposure/white-balance settle
             self.get_logger().info(f'  Warming up camera ({self.camera_warmup_frames} frames)...')
             for _ in range(self.camera_warmup_frames):
                 self.cap.read()
-            self.get_logger().info(f'  Camera warmup complete')
+            self.get_logger().info('  Camera warmup complete')
 
         # Publisher for target info (depth=1 keeps only the newest target).
         self.target_pub = self.create_publisher(TrackedTarget, '/target/pose', TARGET_QOS)
+
+        self.bridge = CvBridge()
+        self.annotated_pub = None
+        if self.publish_annotated_image:
+            self.annotated_pub = self.create_publisher(
+                Image, '/perception/annotated', qos_profile_sensor_data
+            )
 
         # State for holding last known position when target lost
         self.last_x = 0.5
@@ -338,9 +383,14 @@ class PerceptionNode(Node):
 
     def _capture_loop(self):
         """Continuously overwrite the single latest-frame slot."""
+        file_period = 1.0 / max(self.camera_fps, 1)
         while not self._capture_stop.is_set():
             ret, frame = self.cap.read()
             if not ret:
+                if self._is_video_file:
+                    self.get_logger().info('Video source reached end of file')
+                    self._capture_stop.set()
+                    break
                 # Avoid a tight spin if the camera is temporarily unavailable.
                 self._capture_stop.wait(0.01)
                 continue
@@ -350,6 +400,10 @@ class PerceptionNode(Node):
                 self._latest_frame = frame
                 self._latest_frame_stamp = stamp
                 self._frame_seq += 1
+
+            if self._is_video_file:
+                # Real-time playback instead of decoding the whole file at once.
+                self._capture_stop.wait(file_period)
 
     def _take_latest_frame(self):
         """Return the newest unprocessed frame, or skip if none arrived."""
@@ -386,6 +440,18 @@ class PerceptionNode(Node):
                 return
 
         frame_height, frame_width = frame.shape[:2]
+
+        now_perf = time.perf_counter()
+        if self._last_frame_time is not None:
+            frame_dt = now_perf - self._last_frame_time
+            if frame_dt > 0.0:
+                instant_fps = 1.0 / frame_dt
+                self._fps = (
+                    instant_fps
+                    if self._fps <= 0.0
+                    else 0.9 * self._fps + 0.1 * instant_fps
+                )
+        self._last_frame_time = now_perf
 
         # Run YOLO inference. The kwargs already include device/imgsz and the
         # correct FP16 flag for this ultralytics version.
@@ -439,9 +505,10 @@ class PerceptionNode(Node):
             best_confidence = float(tracked_detections.confidence[best_idx])
             track_id = int(tracked_detections.tracker_id[best_idx]) if tracked_detections.tracker_id is not None else 0
 
-            # Compute center in normalized coordinates (0.0-1.0, origin top-left)
+            # Compute normalized center and height (0.0-1.0, origin top-left)
             raw_center_x = (x1 + x2) / 2.0 / frame_width
             raw_center_y = (y1 + y2) / 2.0 / frame_height
+            normalized_height = (y2 - y1) / frame_height
 
             # Apply the configured smoothing filter to x/y.
             # The moving-average branch is kept for comparison/fallback and is
@@ -468,6 +535,7 @@ class PerceptionNode(Node):
 
             self.last_track_id = track_id
 
+            msg.bbox_height = float(normalized_height)
             msg.confidence = best_confidence
             msg.target_visible = True
             msg.track_id = track_id
@@ -476,9 +544,9 @@ class PerceptionNode(Node):
             self.last_x = msg.x
             self.last_y = msg.y
 
-            # Debug window
-            if self.show_debug_window:
-                self._draw_debug_frame(frame, x1, y1, x2, y2, best_confidence, self.target_class, track_id=track_id)
+            self._publish_annotated_image(
+                frame, frame_stamp, x1, y1, x2, y2, best_confidence, track_id
+            )
         else:
             self._publish_target_visible_false(frame, frame_stamp)
             return
@@ -509,41 +577,75 @@ class PerceptionNode(Node):
             msg.stamp = stamp
         self.target_pub.publish(msg)
 
-        if self.show_debug_window and frame is not None:
-            self._draw_debug_frame(frame, 0, 0, 0, 0, 0.0, self.target_class, no_detection=True)
+        if frame is not None:
+            self._publish_annotated_image(frame, stamp, no_detection=True)
 
-    def _draw_debug_frame(self, frame, x1, y1, x2, y2, conf, class_name, no_detection=False, track_id=0):
-        """Draw bounding box and info on frame for debug visualization."""
-        debug_frame = frame.copy()
+    def _annotate_frame(self, frame, x1=0, y1=0, x2=0, y2=0,
+                        conf=0.0, track_id=0, no_detection=False):
+        """Return a copy of the frame with tracking and performance overlays."""
+        annotated = frame.copy()
+
         if not no_detection and x2 > x1 and y2 > y1:
-            # Draw bounding box
-            cv2.rectangle(debug_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            # Draw label with track_id
-            label = f'{class_name} ID:{track_id}: {conf:.2f}'
-            cv2.putText(debug_frame, label, (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            # Draw center point
-            center_x = int((x1 + x2) / 2)
-            center_y = int((y1 + y2) / 2)
-            cv2.circle(debug_frame, (center_x, center_y), 5, (0, 0, 255), -1)
+            cv2.rectangle(
+                annotated, (int(x1), int(y1)), (int(x2), int(y2)),
+                (0, 255, 0), 2,
+            )
+            label = f'{self.target_class} ID:{track_id} {conf:.2f}'
+            cv2.putText(
+                annotated, label, (int(x1), max(int(y1) - 10, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+            )
+            center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+            cv2.circle(annotated, center, 5, (0, 0, 255), -1)
         else:
-            # No detection - draw "NO DETECTION" text
-            cv2.putText(debug_frame, 'NO DETECTION', (50, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            # Draw last known position
-            center_x = int(self.last_x * frame.shape[1])
-            center_y = int(self.last_y * frame.shape[0])
-            cv2.circle(debug_frame, (center_x, center_y), 5, (255, 0, 0), -1)
-            cv2.putText(debug_frame, 'LAST KNOWN', (center_x + 10, center_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            cv2.putText(
+                annotated, 'NO DETECTION', (50, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2,
+            )
+            center = (
+                int(self.last_x * frame.shape[1]),
+                int(self.last_y * frame.shape[0]),
+            )
+            cv2.circle(annotated, center, 5, (255, 0, 0), -1)
+            cv2.putText(
+                annotated, 'LAST KNOWN', (center[0] + 10, center[1]),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1,
+            )
 
-        # Draw image center crosshair
-        h, w = debug_frame.shape[:2]
-        cv2.line(debug_frame, (w//2 - 20, h//2), (w//2 + 20, h//2), (255, 255, 255), 1)
-        cv2.line(debug_frame, (w//2, h//2 - 20), (w//2, h//2 + 20), (255, 255, 255), 1)
+        h, w = annotated.shape[:2]
+        cv2.line(annotated, (w // 2 - 20, h // 2), (w // 2 + 20, h // 2),
+                 (255, 255, 255), 1)
+        cv2.line(annotated, (w // 2, h // 2 - 20), (w // 2, h // 2 + 20),
+                 (255, 255, 255), 1)
 
-        cv2.imshow('YOLO Detection Debug', debug_frame)
-        cv2.waitKey(1)
+        status = (
+            f'FPS: {self._fps:.1f} | Smoother: {self.smoothing_method.upper()} '
+            f'| Inference: {self.last_inference_ms or 0.0:.1f}ms'
+        )
+        cv2.putText(
+            annotated, status, (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1,
+        )
+        return annotated
+
+    def _publish_annotated_image(self, frame, stamp, x1=0, y1=0, x2=0, y2=0,
+                                 conf=0.0, track_id=0, no_detection=False):
+        """Publish the annotated frame and optionally show the debug window."""
+        annotated = self._annotate_frame(
+            frame, x1, y1, x2, y2, conf, track_id, no_detection
+        )
+
+        if self.annotated_pub is not None:
+            image_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
+            image_msg.header.stamp = (
+                stamp if stamp is not None else self.get_clock().now().to_msg()
+            )
+            image_msg.header.frame_id = 'camera'
+            self.annotated_pub.publish(image_msg)
+
+        if self.show_debug_window:
+            cv2.imshow('YOLO Detection Debug', annotated)
+            cv2.waitKey(1)
 
     def destroy_node(self):
         # Stop and join the grabber before touching the capture object.

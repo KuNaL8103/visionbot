@@ -6,6 +6,7 @@ perception_node:
   ros__parameters:
     # Camera settings
     camera_index: 0                    # Video device index (/dev/videoX)
+    camera_source: ""                  # Optional video file path (e.g. "demo.mp4"); overrides index
     camera_width: 640                  # Capture width
     camera_height: 480                 # Capture height
     camera_fps: 30                     # Capture FPS
