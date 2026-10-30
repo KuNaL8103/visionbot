@@ -43,23 +43,30 @@ class ControllerNode(Node):
         self.declare_parameter('target_distance', 1.0)  # desired distance from target (meters)
         self.declare_parameter('deadband', 0.1)  # distance deadband (meters)
         self.declare_parameter('dead_zone_px', 0.05)  # dead zone in normalized x (0-1)
-        self.declare_parameter('target_lost_timeout_sec', 1.0)  # seconds - watchdog timeout for zero Twist
+        # seconds - watchdog timeout for zero Twist
+        self.declare_parameter('target_lost_timeout_sec', 1.0)
         self.declare_parameter('enable_safety_stop', True)
         self.declare_parameter('publish_rate_hz', 60.0)  # Faster cmd_vel dispatch
 
         # Get parameter values
         self.linear_gain = self.get_parameter('linear_gain').get_parameter_value().double_value
         self.angular_gain = self.get_parameter('angular_gain').get_parameter_value().double_value
-        self.max_linear_speed = self.get_parameter('max_linear_speed').get_parameter_value().double_value
-        self.max_angular_speed = self.get_parameter('max_angular_speed').get_parameter_value().double_value
-        self.target_distance = self.get_parameter('target_distance').get_parameter_value().double_value
+        self.max_linear_speed = self.get_parameter(
+            'max_linear_speed').get_parameter_value().double_value
+        self.max_angular_speed = self.get_parameter(
+            'max_angular_speed').get_parameter_value().double_value
+        self.target_distance = self.get_parameter(
+            'target_distance').get_parameter_value().double_value
         self.deadband = self.get_parameter('deadband').get_parameter_value().double_value
         self.dead_zone_px = self.get_parameter('dead_zone_px').get_parameter_value().double_value
-        self.target_lost_timeout_sec = self.get_parameter('target_lost_timeout_sec').get_parameter_value().double_value
-        self.enable_safety_stop = self.get_parameter('enable_safety_stop').get_parameter_value().bool_value
-        self.publish_rate_hz = self.get_parameter('publish_rate_hz').get_parameter_value().double_value
+        self.target_lost_timeout_sec = self.get_parameter(
+            'target_lost_timeout_sec').get_parameter_value().double_value
+        self.enable_safety_stop = self.get_parameter(
+            'enable_safety_stop').get_parameter_value().bool_value
+        self.publish_rate_hz = self.get_parameter(
+            'publish_rate_hz').get_parameter_value().double_value
 
-        self.get_logger().info(f'Controller node initialized')
+        self.get_logger().info('Controller node initialized')
         self.get_logger().info(f'  linear_gain: {self.linear_gain}')
         self.get_logger().info(f'  angular_gain: {self.angular_gain}')
         self.get_logger().info(f'  max_linear_speed: {self.max_linear_speed}')
@@ -91,8 +98,8 @@ class ControllerNode(Node):
         timer_period = 1.0 / self.publish_rate_hz
         self.timer = self.create_timer(timer_period, self.timer_callback)
 
-        # Watchdog timer: publishes zero Twist if target lost for longer than target_lost_timeout_sec
-        self.watchdog_timer = self.create_timer(0.1, self.watchdog_callback)  # 10 Hz check
+        # Watchdog: publish zero Twist if the target is lost too long.
+        self.watchdog_timer = self.create_timer(0.1, self.watchdog_callback)
 
     @staticmethod
     def _stamp_ns(stamp) -> int:
@@ -113,7 +120,7 @@ class ControllerNode(Node):
         self.last_target_time = self.get_clock().now()
 
     def watchdog_callback(self):
-        """Watchdog timer: publishes zero Twist if target lost for longer than target_lost_timeout_sec."""
+        """Publish zero Twist if the target has been lost past the timeout."""
         if self.latest_target is None:
             # No target ever received - publish zero (safety)
             if self.enable_safety_stop:
@@ -125,7 +132,9 @@ class ControllerNode(Node):
             elapsed = (self.get_clock().now() - self.last_target_time).nanoseconds / 1e9
             if elapsed > self.target_lost_timeout_sec:
                 if self.enable_safety_stop:
-                    self.get_logger().debug(f'Watchdog: target lost for {elapsed:.2f}s (> {self.target_lost_timeout_sec}s), publishing zero Twist')
+                    self.get_logger().debug(
+                        f'Watchdog: target lost {elapsed:.2f}s '
+                        f'(> {self.target_lost_timeout_sec}s); stopping')
                     self._publish_zero_twist()
 
     def _publish_zero_twist(self):
@@ -173,7 +182,8 @@ class ControllerNode(Node):
             if elapsed > self.target_lost_timeout_sec:
                 self.last_latency_sec = None
                 if self.enable_safety_stop:
-                    self.get_logger().debug(f'Target timeout ({elapsed:.2f}s), publishing zero velocity')
+                    self.get_logger().debug(
+                        f'Target timeout ({elapsed:.2f}s), publishing zero velocity')
                 return twist_stamped
 
         # Reject a message that arrived on time but carries a stale frame stamp
@@ -194,7 +204,6 @@ class ControllerNode(Node):
 
         # Extract target position (normalized 0-1)
         target_x = self.latest_target.x
-        target_y = self.latest_target.y
 
         # Compute horizontal error from image center (0.5)
         error_x = target_x - 0.5

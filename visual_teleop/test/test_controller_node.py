@@ -7,13 +7,12 @@ without requiring a camera or simulation.
 """
 
 import unittest
+
 import rclpy
-from rclpy.node import Node
-from visual_teleop_msgs.msg import TrackedTarget
-from geometry_msgs.msg import Twist, TwistStamped
-from builtin_interfaces.msg import Time
+from geometry_msgs.msg import TwistStamped
 
 from visual_teleop.controller_node import ControllerNode
+from visual_teleop_msgs.msg import TrackedTarget
 
 
 class TestControllerNode(unittest.TestCase):
@@ -57,8 +56,9 @@ class TestControllerNode(unittest.TestCase):
         twist_stamped = self.node.compute_cmd_vel()
 
         # Angular velocity should be zero (within dead_zone_px)
-        self.assertAlmostEqual(twist_stamped.twist.angular.z, 0.0, places=5,
-                               msg=f"Expected angular.z ~ 0.0, got {twist_stamped.twist.angular.z}")
+        self.assertAlmostEqual(
+            twist_stamped.twist.angular.z, 0.0, places=5,
+            msg='angular.z should be near zero')
 
         # Linear velocity should be positive (target is centered)
         self.assertGreater(twist_stamped.twist.linear.x, 0.0,
@@ -74,14 +74,16 @@ class TestControllerNode(unittest.TestCase):
         # Angular velocity should be positive (turn LEFT/CCW to center target on left)
         # ROS convention: angular.z > 0 = CCW = turn LEFT
         # Target on LEFT side of image (x < 0.5) -> robot must turn LEFT -> angular.z > 0
-        self.assertGreater(twist_stamped.twist.angular.z, 0.0,
-                           msg=f"Expected positive angular.z for left target, got {twist_stamped.twist.angular.z}")
+        self.assertGreater(
+            twist_stamped.twist.angular.z, 0.0,
+            msg='left target should produce positive angular.z')
         # Magnitude should be clamped to max_angular_speed
         self.assertLessEqual(twist_stamped.twist.angular.z, self.node.max_angular_speed)
 
         # Linear velocity should be zero (target too far left, not forward-facing)
-        self.assertEqual(twist_stamped.twist.linear.x, 0.0,
-                         msg=f"Expected zero linear.x for far-left target, got {twist_stamped.twist.linear.x}")
+        self.assertEqual(
+            twist_stamped.twist.linear.x, 0.0,
+            msg='far-left target should not move forward')
 
     def test_far_right_produces_negative_angular(self):
         """Target far right (x=0.9) should produce negative angular velocity (turn RIGHT/CW)."""
@@ -92,14 +94,16 @@ class TestControllerNode(unittest.TestCase):
         # Angular velocity should be negative (turn RIGHT/CW to center target on right)
         # ROS convention: angular.z < 0 = CW = turn RIGHT
         # Target on RIGHT side of image (x > 0.5) -> robot must turn RIGHT -> angular.z < 0
-        self.assertLess(twist_stamped.twist.angular.z, 0.0,
-                        msg=f"Expected negative angular.z for right target, got {twist_stamped.twist.angular.z}")
+        self.assertLess(
+            twist_stamped.twist.angular.z, 0.0,
+            msg='right target should produce negative angular.z')
         # Magnitude should be clamped to max_angular_speed
         self.assertGreaterEqual(twist_stamped.twist.angular.z, -self.node.max_angular_speed)
 
         # Linear velocity should be zero (target too far right, not forward-facing)
-        self.assertEqual(twist_stamped.twist.linear.x, 0.0,
-                         msg=f"Expected zero linear.x for far-right target, got {twist_stamped.twist.linear.x}")
+        self.assertEqual(
+            twist_stamped.twist.linear.x, 0.0,
+            msg='far-right target should not move forward')
 
     def test_target_not_visible_produces_zero_twist(self):
         """target_visible=False should produce zero Twist (stop)."""
@@ -108,20 +112,24 @@ class TestControllerNode(unittest.TestCase):
         twist_stamped = self.node.compute_cmd_vel()
 
         # Both linear and angular should be zero
-        self.assertEqual(twist_stamped.twist.linear.x, 0.0,
-                         msg=f"Expected zero linear.x when target not visible, got {twist_stamped.twist.linear.x}")
-        self.assertEqual(twist_stamped.twist.angular.z, 0.0,
-                         msg=f"Expected zero angular.z when target not visible, got {twist_stamped.twist.angular.z}")
+        self.assertEqual(
+            twist_stamped.twist.linear.x, 0.0,
+            msg='linear.x should be zero when target is not visible')
+        self.assertEqual(
+            twist_stamped.twist.angular.z, 0.0,
+            msg='angular.z should be zero when target is not visible')
 
     def test_no_target_received_produces_zero_twist(self):
         """No target received yet should produce zero Twist."""
         # Don't call target_callback at all
         twist_stamped = self.node.compute_cmd_vel()
 
-        self.assertEqual(twist_stamped.twist.linear.x, 0.0,
-                         msg=f"Expected zero linear.x with no target, got {twist_stamped.twist.linear.x}")
-        self.assertEqual(twist_stamped.twist.angular.z, 0.0,
-                         msg=f"Expected zero angular.z with no target, got {twist_stamped.twist.angular.z}")
+        self.assertEqual(
+            twist_stamped.twist.linear.x, 0.0,
+            msg='linear.x should be zero with no target')
+        self.assertEqual(
+            twist_stamped.twist.angular.z, 0.0,
+            msg='angular.z should be zero with no target')
 
     def test_target_within_dead_zone_produces_zero_angular(self):
         """Target within dead_zone_px of center should produce zero angular velocity."""
@@ -130,8 +138,9 @@ class TestControllerNode(unittest.TestCase):
         self.node.target_callback(target)
         twist_stamped = self.node.compute_cmd_vel()
 
-        self.assertAlmostEqual(twist_stamped.twist.angular.z, 0.0, places=5,
-                               msg=f"Expected zero angular.z within dead zone, got {twist_stamped.twist.angular.z}")
+        self.assertAlmostEqual(
+            twist_stamped.twist.angular.z, 0.0, places=5,
+            msg='angular.z should be zero inside dead zone')
 
     def test_angular_velocity_clamped_to_max(self):
         """Angular velocity should be clamped to max_angular_speed."""
@@ -142,8 +151,10 @@ class TestControllerNode(unittest.TestCase):
 
         # With angular_gain=1.0, error=-0.5 -> angular_vel=0.5 (within max 1.82)
         # But with larger gain it would clamp. Let's verify it doesn't exceed max.
-        self.assertLessEqual(abs(twist_stamped.twist.angular.z), self.node.max_angular_speed + 1e-6,
-                             msg=f"Angular velocity {twist_stamped.twist.angular.z} exceeds max {self.node.max_angular_speed}")
+        self.assertLessEqual(
+            abs(twist_stamped.twist.angular.z),
+            self.node.max_angular_speed + 1e-6,
+            msg='angular velocity exceeds max')
 
     def test_linear_velocity_clamped_to_max(self):
         """Linear velocity should be clamped to max_linear_speed."""
@@ -152,8 +163,10 @@ class TestControllerNode(unittest.TestCase):
         self.node.target_callback(target)
         twist_stamped = self.node.compute_cmd_vel()
 
-        self.assertLessEqual(twist_stamped.twist.linear.x, self.node.max_linear_speed + 1e-6,
-                             msg=f"Linear velocity {twist_stamped.twist.linear.x} exceeds max {self.node.max_linear_speed}")
+        self.assertLessEqual(
+            twist_stamped.twist.linear.x,
+            self.node.max_linear_speed + 1e-6,
+            msg='linear velocity exceeds max')
         self.assertGreaterEqual(twist_stamped.twist.linear.x, 0.0)
 
     def test_target_slightly_left_still_moves_forward(self):
@@ -206,14 +219,14 @@ class TestControllerNode(unittest.TestCase):
         self.assertLess(twist_stamped.twist.angular.z, 0.0)
 
     def test_watchdog_publishes_zero_twist_when_target_lost_no_new_messages(self):
-        """Watchdog should publish zero Twist if target_visible=false for > target_lost_timeout_sec,
-        even if no new messages arrive."""
+        """Watchdog should stop the robot after a target-lost timeout."""
         # First, send a visible target
         target = self._create_target(x=0.5, y=0.5, target_visible=True)
         self.node.target_callback(target)
 
         # Capture published messages from watchdog
         published_messages = []
+
         def capture_publish(msg):
             published_messages.append(msg)
         original_publish = self.node.cmd_vel_pub.publish
@@ -227,16 +240,18 @@ class TestControllerNode(unittest.TestCase):
         # so we'll directly manipulate the last_target_time to simulate elapsed time)
         # The watchdog checks: elapsed = (now - last_target_time) > target_lost_timeout_sec
         # We'll set last_target_time to be older than target_lost_timeout_sec
-        from rclpy.time import Time
-        old_time = self.node.get_clock().now() - rclpy.duration.Duration(seconds=self.node.target_lost_timeout_sec + 0.5)
+        old_time = self.node.get_clock().now() - rclpy.duration.Duration(
+            seconds=self.node.target_lost_timeout_sec + 0.5
+        )
         self.node.last_target_time = old_time
 
         # Call watchdog_callback directly (simulates 10Hz timer firing)
         self.node.watchdog_callback()
 
         # Verify zero Twist was published by watchdog
-        self.assertEqual(len(published_messages), 1,
-                         msg=f"Expected watchdog to publish 1 zero Twist, got {len(published_messages)}")
+        self.assertEqual(
+            len(published_messages), 1,
+            msg='watchdog should publish exactly one zero Twist')
         msg = published_messages[0]
         self.assertEqual(msg.twist.linear.x, 0.0, "Watchdog should publish zero linear.x")
         self.assertEqual(msg.twist.angular.z, 0.0, "Watchdog should publish zero angular.z")
@@ -245,7 +260,7 @@ class TestControllerNode(unittest.TestCase):
         self.node.cmd_vel_pub.publish = original_publish
 
     def test_latency_logging_with_valid_stamp(self):
-        """Test that compute_cmd_vel computes sane latency when msg.stamp is set to N ms in the past."""
+        """Latency should be sane for a fresh frame timestamp."""
         # Create a target with stamp from 50ms ago
         target = self._create_target(x=0.5, y=0.5, target_visible=True)
 
@@ -269,8 +284,10 @@ class TestControllerNode(unittest.TestCase):
         # Verify computed latency is exposed and close to expected 50ms (0.05s)
         # Allow some tolerance for execution time (±20ms)
         self.assertIsNotNone(self.node.last_latency_sec, "last_latency_sec should be set")
-        self.assertGreater(self.node.last_latency_sec, 0.02, "Latency should be positive and > 20ms")
-        self.assertLess(self.node.last_latency_sec, 0.1, "Latency should be < 100ms (close to 50ms)")
+        self.assertGreater(self.node.last_latency_sec, 0.02,
+                           "Latency should be positive and > 20ms")
+        self.assertLess(self.node.last_latency_sec, 0.1,
+                        "Latency should be < 100ms (close to 50ms)")
 
 
 if __name__ == '__main__':

@@ -120,8 +120,10 @@ class PerceptionNode(Node):
         self.declare_parameter('camera_height', 480)
         self.declare_parameter('camera_fps', 30)
         self.declare_parameter('camera_backend', 'v4l2')  # v4l2, any, gstreamer, ffmpeg
-        self.declare_parameter('camera_fourcc', 'MJPG')   # MJPG (default — YUYV causes corrupted frames on this hardware, see TROUBLESHOOTING.md)
-        self.declare_parameter('camera_warmup_frames', 10)  # Frames to discard for auto-exposure settle
+        # MJPG (default — YUYV causes corrupted frames on this hardware, see TROUBLESHOOTING.md)
+        self.declare_parameter('camera_fourcc', 'MJPG')
+        # Frames to discard for auto-exposure settle
+        self.declare_parameter('camera_warmup_frames', 10)
         self.declare_parameter('camera_capture_threaded', True)  # Latest-frame grabber
         self.declare_parameter('publish_rate_hz', 30.0)
         self.declare_parameter('yolo_model', 'yolov8n.pt')
@@ -129,10 +131,12 @@ class PerceptionNode(Node):
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('device', 'auto')  # auto, cpu, cuda, cuda:0, ...
-        self.declare_parameter('yolo_imgsz', 320)  # Inference resolution (320 is ~3x faster than 640)
+        # Inference resolution (320 is ~3x faster than 640)
+        self.declare_parameter('yolo_imgsz', 320)
         self.declare_parameter('yolo_half', True)  # FP16 on CUDA only
         self.declare_parameter('yolo_max_det', 20)  # Cap boxes before NMS
-        self.declare_parameter('inference_poll_rate_hz', 60.0)  # Poll latest frame faster than the camera
+        # Poll latest frame faster than the camera
+        self.declare_parameter('inference_poll_rate_hz', 60.0)
         self.declare_parameter('publish_annotated_image', True)
         self.declare_parameter('show_debug_window', False)
         # ByteTrack parameters
@@ -148,28 +152,36 @@ class PerceptionNode(Node):
         self.declare_parameter('kalman_process_noise', 0.1)        # White-acceleration q
         self.declare_parameter('kalman_measurement_noise', 0.002)  # Measurement variance r
         self.declare_parameter('kalman_initial_covariance', 1.0)   # Initial state uncertainty
-        self.declare_parameter('kalman_coast_frames', 15)          # Max predict-only frames during occlusion
+        # Max predict-only frames during occlusion
+        self.declare_parameter('kalman_coast_frames', 15)
 
         # Get parameter values
         self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
         self.camera_source = self.get_parameter('camera_source').get_parameter_value().string_value
         self.camera_width = self.get_parameter('camera_width').get_parameter_value().integer_value
-        self.camera_height = self.get_parameter('camera_height').get_parameter_value().integer_value
+        self.camera_height = self.get_parameter(
+            'camera_height').get_parameter_value().integer_value
         self.camera_fps = self.get_parameter('camera_fps').get_parameter_value().integer_value
-        self.camera_backend = self.get_parameter('camera_backend').get_parameter_value().string_value
+        self.camera_backend = self.get_parameter(
+            'camera_backend').get_parameter_value().string_value
         self.camera_fourcc = self.get_parameter('camera_fourcc').get_parameter_value().string_value
-        self.camera_warmup_frames = self.get_parameter('camera_warmup_frames').get_parameter_value().integer_value
-        self.camera_capture_threaded = self.get_parameter('camera_capture_threaded').get_parameter_value().bool_value
-        self.publish_rate_hz = self.get_parameter('publish_rate_hz').get_parameter_value().double_value
+        self.camera_warmup_frames = self.get_parameter(
+            'camera_warmup_frames').get_parameter_value().integer_value
+        self.camera_capture_threaded = self.get_parameter(
+            'camera_capture_threaded').get_parameter_value().bool_value
+        self.publish_rate_hz = self.get_parameter(
+            'publish_rate_hz').get_parameter_value().double_value
         self.yolo_model_path = self.get_parameter('yolo_model').get_parameter_value().string_value
         self.target_class = self.get_parameter('target_class').get_parameter_value().string_value
-        self.confidence_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
+        self.confidence_threshold = self.get_parameter(
+            'confidence_threshold').get_parameter_value().double_value
         self.iou_threshold = self.get_parameter('iou_threshold').get_parameter_value().double_value
         requested_device = self.get_parameter('device').get_parameter_value().string_value
         self.yolo_imgsz = self.get_parameter('yolo_imgsz').get_parameter_value().integer_value
         self.yolo_half_requested = self.get_parameter('yolo_half').get_parameter_value().bool_value
         self.yolo_max_det = self.get_parameter('yolo_max_det').get_parameter_value().integer_value
-        self.inference_poll_rate_hz = self.get_parameter('inference_poll_rate_hz').get_parameter_value().double_value
+        self.inference_poll_rate_hz = self.get_parameter(
+            'inference_poll_rate_hz').get_parameter_value().double_value
         self.publish_annotated_image = (
             self.get_parameter('publish_annotated_image').get_parameter_value().bool_value
         )
@@ -178,20 +190,31 @@ class PerceptionNode(Node):
         self.last_inference_ms = None
         self._fps = 0.0
         self._last_frame_time = None
-        self.show_debug_window = self.get_parameter('show_debug_window').get_parameter_value().bool_value
+        self.show_debug_window = self.get_parameter(
+            'show_debug_window').get_parameter_value().bool_value
         # ByteTrack parameters
-        self.track_activation_threshold = self.get_parameter('track_activation_threshold').get_parameter_value().double_value
-        self.minimum_matching_threshold = self.get_parameter('minimum_matching_threshold').get_parameter_value().double_value
-        self.max_time_lost = self.get_parameter('max_time_lost').get_parameter_value().integer_value
-        self.minimum_consecutive_frames = self.get_parameter('minimum_consecutive_frames').get_parameter_value().integer_value
+        self.track_activation_threshold = self.get_parameter(
+            'track_activation_threshold').get_parameter_value().double_value
+        self.minimum_matching_threshold = self.get_parameter(
+            'minimum_matching_threshold').get_parameter_value().double_value
+        self.max_time_lost = self.get_parameter(
+            'max_time_lost').get_parameter_value().integer_value
+        self.minimum_consecutive_frames = self.get_parameter(
+            'minimum_consecutive_frames').get_parameter_value().integer_value
 
         # Smoothing filter parameters
-        self.smoothing_method = self.get_parameter('smoothing_method').get_parameter_value().string_value.lower()
-        self.smoothing_window_size = self.get_parameter('smoothing_window_size').get_parameter_value().integer_value
-        self.kalman_process_noise = self.get_parameter('kalman_process_noise').get_parameter_value().double_value
-        self.kalman_measurement_noise = self.get_parameter('kalman_measurement_noise').get_parameter_value().double_value
-        self.kalman_initial_covariance = self.get_parameter('kalman_initial_covariance').get_parameter_value().double_value
-        self.kalman_coast_frames = self.get_parameter('kalman_coast_frames').get_parameter_value().integer_value
+        self.smoothing_method = self.get_parameter(
+            'smoothing_method').get_parameter_value().string_value.lower()
+        self.smoothing_window_size = self.get_parameter(
+            'smoothing_window_size').get_parameter_value().integer_value
+        self.kalman_process_noise = self.get_parameter(
+            'kalman_process_noise').get_parameter_value().double_value
+        self.kalman_measurement_noise = self.get_parameter(
+            'kalman_measurement_noise').get_parameter_value().double_value
+        self.kalman_initial_covariance = self.get_parameter(
+            'kalman_initial_covariance').get_parameter_value().double_value
+        self.kalman_coast_frames = self.get_parameter(
+            'kalman_coast_frames').get_parameter_value().integer_value
 
         if self.smoothing_method not in ('kalman', 'moving_average', 'none'):
             self.get_logger().warn(
@@ -220,7 +243,7 @@ class PerceptionNode(Node):
             )
         self.last_track_id = None
 
-        self.get_logger().info(f'Perception node initialized')
+        self.get_logger().info('Perception node initialized')
         self.get_logger().info(f'  camera_index: {self.camera_index}')
         self.get_logger().info(f'  camera_source: {self.camera_source or "<webcam index>"}')
         self.get_logger().info(f'  camera_width: {self.camera_width}')
@@ -251,7 +274,8 @@ class PerceptionNode(Node):
         if self.kalman_filter is not None:
             self.get_logger().info(f'  kalman_process_noise: {self.kalman_process_noise}')
             self.get_logger().info(f'  kalman_measurement_noise: {self.kalman_measurement_noise}')
-            self.get_logger().info(f'  kalman_initial_covariance: {self.kalman_initial_covariance}')
+            self.get_logger().info(
+                f'  kalman_initial_covariance: {self.kalman_initial_covariance}')
             self.get_logger().info(f'  kalman_coast_frames: {self.kalman_coast_frames}')
 
         # Load YOLO model
@@ -280,9 +304,12 @@ class PerceptionNode(Node):
                 self.target_class_idx = idx
                 break
         if self.target_class_idx is None:
-            self.get_logger().warn(f'Target class "{self.target_class}" not found in model classes: {list(self.class_names.values())}')
+            self.get_logger().warn(
+                f'Target class "{self.target_class}" not found in model classes: '
+                f'{list(self.class_names.values())}')
         else:
-            self.get_logger().info(f'Target class "{self.target_class}" has index {self.target_class_idx}')
+            self.get_logger().info(
+                f'Target class "{self.target_class}" has index {self.target_class_idx}')
 
         # Pay the first-call CUDA/JIT/NMS cost before the control loop starts.
         self._warmup_inference()
@@ -361,7 +388,11 @@ class PerceptionNode(Node):
 
         # The capture thread is started from main() so direct node construction
         # (unit tests, embedding) remains synchronous unless explicitly started.
-        poll_rate = self.inference_poll_rate_hz if self.inference_poll_rate_hz > 0.0 else self.publish_rate_hz
+        poll_rate = (
+            self.inference_poll_rate_hz
+            if self.inference_poll_rate_hz > 0.0
+            else self.publish_rate_hz
+        )
         self.timer = self.create_timer(1.0 / poll_rate, self.timer_callback)
 
     def start_capture_thread(self):
@@ -435,7 +466,10 @@ class PerceptionNode(Node):
             frame_stamp = self.get_clock().now().to_msg()
             ret, frame = self.cap.read()
             if not ret:
-                self.get_logger().warn('Failed to read frame from camera', throttle_duration_sec=5.0)
+                self.get_logger().warn(
+                    'Failed to read frame from camera',
+                    throttle_duration_sec=5.0,
+                )
                 self._publish_target_visible_false(stamp=frame_stamp)
                 return
 
@@ -503,7 +537,11 @@ class PerceptionNode(Node):
             best_idx = np.argmax(tracked_detections.confidence)
             x1, y1, x2, y2 = tracked_detections.xyxy[best_idx]
             best_confidence = float(tracked_detections.confidence[best_idx])
-            track_id = int(tracked_detections.tracker_id[best_idx]) if tracked_detections.tracker_id is not None else 0
+            track_id = (
+                int(tracked_detections.tracker_id[best_idx])
+                if tracked_detections.tracker_id is not None
+                else 0
+            )
 
             # Compute normalized center and height (0.0-1.0, origin top-left)
             raw_center_x = (x1 + x2) / 2.0 / frame_width

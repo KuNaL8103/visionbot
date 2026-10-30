@@ -45,7 +45,8 @@ class TrackerWrapper:
                 minimum_consecutive_frames
             )
 
-    def update(self, boxes: np.ndarray, confidences: np.ndarray, class_ids: np.ndarray) -> Detections:
+    def update(self, boxes: np.ndarray, confidences: np.ndarray,
+               class_ids: np.ndarray) -> Detections:
         """
         Update tracker with new detections.
 

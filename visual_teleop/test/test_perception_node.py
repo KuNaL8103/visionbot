@@ -80,7 +80,8 @@ class TestPerceptionNode(unittest.TestCase):
         self.mock_tracker_class.return_value = self.mock_tracker
 
         # Mock create_timer to prevent timer from firing during init (warmup)
-        self.mock_timer_patcher = patch.object(PerceptionNode, 'create_timer', return_value=MagicMock())
+        self.mock_timer_patcher = patch.object(
+            PerceptionNode, 'create_timer', return_value=MagicMock())
         self.mock_timer = self.mock_timer_patcher.start()
 
     def tearDown(self):
@@ -127,7 +128,6 @@ class TestPerceptionNode(unittest.TestCase):
             published_messages.append(msg)
 
         # Replace publisher's publish method
-        original_publish = node.target_pub.publish
         node.target_pub.publish = capture_publish
 
         # Call timer callback directly
@@ -141,10 +141,13 @@ class TestPerceptionNode(unittest.TestCase):
 
         # Check mocked detector values (bbox [100,100,300,300] on 640x480 frame)
         # Center = (200, 200), normalized = (200/640, 200/480) = (0.3125, 0.41666...)
-        self.assertAlmostEqual(msg.x, 200/640, places=4, msg="x should be normalized center of mocked bbox")
-        self.assertAlmostEqual(msg.y, 200/480, places=4, msg="y should be normalized center of mocked bbox")
-        self.assertAlmostEqual(msg.confidence, 0.8, places=4, msg="confidence should match mocked detection")
-        self.assertAlmostEqual(msg.bbox_height, 200/480, places=4,
+        self.assertAlmostEqual(msg.x, 200 / 640, places=4,
+                               msg="x should be normalized center of mocked bbox")
+        self.assertAlmostEqual(msg.y, 200 / 480, places=4,
+                               msg="y should be normalized center of mocked bbox")
+        self.assertAlmostEqual(msg.confidence, 0.8, places=4,
+                               msg="confidence should match mocked detection")
+        self.assertAlmostEqual(msg.bbox_height, 200 / 480, places=4,
                                msg="bbox_height should be normalized bbox height")
         self.assertTrue(msg.target_visible, "target_visible should be True for detection")
         self.assertEqual(msg.track_id, 1, "track_id should match mocked tracker output")
@@ -156,6 +159,7 @@ class TestPerceptionNode(unittest.TestCase):
         node = PerceptionNode()
 
         published_messages = []
+
         def capture_publish(msg):
             published_messages.append(msg)
         node.target_pub.publish = capture_publish
@@ -168,8 +172,8 @@ class TestPerceptionNode(unittest.TestCase):
 
         # All messages should be identical (mocked detector)
         for msg in published_messages:
-            self.assertAlmostEqual(msg.x, 200/640, places=4)
-            self.assertAlmostEqual(msg.y, 200/480, places=4)
+            self.assertAlmostEqual(msg.x, 200 / 640, places=4)
+            self.assertAlmostEqual(msg.y, 200 / 480, places=4)
             self.assertAlmostEqual(msg.confidence, 0.8, places=4)
             self.assertTrue(msg.target_visible)
             self.assertEqual(msg.track_id, 1)
@@ -255,7 +259,7 @@ class TestPerceptionNode(unittest.TestCase):
         node.destroy_node()
 
     def test_smoothing_moving_average(self):
-        """Test that published x/y is moving average of last N raw positions, not raw value itself."""
+        """Published x/y should be the moving average of recent raw positions."""
         # Create node with smoothing_window_size=3 (will be loaded from params.yaml default 5,
         # but we need to test with a specific window size)
         # We'll mock the parameter loading by creating a node with custom params
@@ -285,9 +289,9 @@ class TestPerceptionNode(unittest.TestCase):
         ]
 
         expected_centers = [
-            (200/640, 200/480),    # 0.3125, 0.4167
-            (220/640, 220/480),    # 0.34375, 0.45833
-            (240/640, 240/480),    # 0.375, 0.5
+            (200 / 640, 200 / 480),    # 0.3125, 0.4167
+            (220 / 640, 220 / 480),    # 0.34375, 0.45833
+            (240 / 640, 240 / 480),    # 0.375, 0.5
         ]
 
         for i, (bbox, (exp_x, exp_y)) in enumerate(zip(bboxes, expected_centers)):
@@ -307,26 +311,28 @@ class TestPerceptionNode(unittest.TestCase):
 
             # For first frame, smoothing buffer has 1 element -> average = raw
             if i == 0:
-                self.assertAlmostEqual(msg.x, exp_x, places=4,
-                    msg=f"Frame {i+1}: x should equal raw (buffer has 1 element)")
-                self.assertAlmostEqual(msg.y, exp_y, places=4,
-                    msg=f"Frame {i+1}: y should equal raw (buffer has 1 element)")
+                self.assertAlmostEqual(
+                    msg.x, exp_x, places=4,
+                    msg=f'frame {i + 1}: x should equal raw')
+                self.assertAlmostEqual(
+                    msg.y, exp_y, places=4,
+                    msg=f'frame {i + 1}: y should equal raw')
             # For second frame, buffer has 2 elements -> average of first 2
             elif i == 1:
                 avg_x = (expected_centers[0][0] + expected_centers[1][0]) / 2
                 avg_y = (expected_centers[0][1] + expected_centers[1][1]) / 2
                 self.assertAlmostEqual(msg.x, avg_x, places=4,
-                    msg=f"Frame {i+1}: x should be average of first 2 frames")
+                                       msg=f"Frame {i + 1}: x should be average of first 2 frames")
                 self.assertAlmostEqual(msg.y, avg_y, places=4,
-                    msg=f"Frame {i+1}: y should be average of first 2 frames")
+                                       msg=f"Frame {i + 1}: y should be average of first 2 frames")
             # For third frame, buffer has 3 elements -> average of all 3
             elif i == 2:
                 avg_x = sum(c[0] for c in expected_centers) / 3
                 avg_y = sum(c[1] for c in expected_centers) / 3
                 self.assertAlmostEqual(msg.x, avg_x, places=4,
-                    msg=f"Frame {i+1}: x should be average of 3 frames")
+                                       msg=f"Frame {i + 1}: x should be average of 3 frames")
                 self.assertAlmostEqual(msg.y, avg_y, places=4,
-                    msg=f"Frame {i+1}: y should be average of 3 frames")
+                                       msg=f"Frame {i + 1}: y should be average of 3 frames")
 
         node.destroy_node()
 
