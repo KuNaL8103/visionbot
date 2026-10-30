@@ -2,13 +2,13 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>visual_teleop</name>
-  <version>0.0.0</version>
+  <version>0.1.0</version>
   <description>Visual teleoperation package using webcam for target tracking and TurtleBot3 control</description>
-  <maintainer email="kunal@example.com">kunal</maintainer>
+  <maintainer email="kunaldabbe2003@gmail.com">Kunal Dabbe</maintainer>
   <license>Apache-2.0</license>
+  <url type="website">https://github.com/KuNaL8103/VisionBot</url>
 
   <buildtool_depend>ament_python</buildtool_depend>
-  <buildtool_depend>ament_cmake</buildtool_depend>
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
@@ -20,12 +20,15 @@
   <exec_depend>visual_teleop_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>turtlebot3_gazebo</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>launch_testing</test_depend>
-  <test_depend>launch_testing_ament</test_depend>
+  <test_depend>launch_testing_ament_cmake</test_depend>
   <test_depend>pytest</test_depend>
 
   <export>
