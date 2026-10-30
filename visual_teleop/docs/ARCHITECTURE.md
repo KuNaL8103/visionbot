@@ -56,13 +56,17 @@ Target latency budget: **<150ms camera-to-cmd_vel** (measured via `msg.stamp` â†
 
 | Stage | Target Latency |
 |-------|----------------|
-| Camera capture | ~33ms (30 FPS) |
-| YOLO inference | ~30-50ms (CPU, yolov8n) |
+| Camera capture | 0-33ms (latest-frame thread at 30 FPS) |
+| YOLO inference | ~15-40ms (CUDA, yolov8n, imgsz=320) |
 | ByteTrack update | ~5ms |
 | TrackedTarget publish | ~1ms |
-| Controller compute | ~1ms |
+| Controller compute | <1ms |
 | ROS 2 publish | ~5ms |
-| **Total** | **~75-95ms** |
+| **Total** | **~50-100ms typical** |
+
+Latency is logged by `controller_node` from frame capture timestamp to
+`/cmd_vel` publish. GPU/CPU contention (for example, with the Gazebo GUI)
+will increase inference time and therefore end-to-end latency.
 
 ## Parameters
 All parameters in `config/params.yaml`, loaded via `declare_parameter`.
